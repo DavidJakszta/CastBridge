@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CastBridge</string>
+
+    <string name="nearby_devices">Nearby devices</string>
+    <string name="nearby_subtitle">Chromecast and Roku on your Wi-Fi. Tap a device to select it.</string>
+    <string name="scanning">Scanning</string>
+    <string name="idle">Idle</string>
+    <plurals name="device_count">
+        <item quantity="one">%1$d found</item>
+        <item quantity="other">%1$d found</item>
+    </plurals>
+
+    <string name="filter_all">All</string>
+    <string name="filter_chromecast">Chromecast</string>
+    <string name="filter_roku">Roku</string>
+
+    <string name="empty_title">Looking for your TV</string>
+    <string name="empty_body">Keep your phone and TV on the same Wi-Fi network. Discovery runs automatically while this screen is open.</string>
+    <string name="empty_tip">Guest and corporate Wi-Fi networks often block local device discovery.</string>
+    <string name="empty_filtered_title">No %1$s devices found</string>
+    <string name="show_all_devices">Show all devices</string>
+
+    <string name="selected_device_label">Selected</string>
+    <string name="details">Details</string>
+    <string name="test">Test</string>
+    <string name="test_connection">Test connection</string>
+    <string name="testing">Testing…</string>
+    <string name="connection_reachable">Connected in %1$d ms</string>
+    <string name="connection_unreachable">Could not reach device: %1$s</string>
+    <string name="connection_snackbar_reachable">%1$s is reachable (%2$d ms)</string>
+    <string name="connection_snackbar_unreachable">%1$s is unreachable: %2$s</string>
+
+    <string name="protocol_google_cast">Google Cast</string>
+    <string name="protocol_roku">Roku</string>
+    <string name="device_protocol">Protocol</string>
+    <string name="device_model">Model</string>
+    <string name="device_ip">IP address</string>
+    <string name="device_port">Port</string>
+    <string name="device_serial">Serial number</string>
+    <string name="device_vendor">Vendor</string>
+    <string name="device_cast_id">Cast device ID</string>
+    <string name="unknown">Unknown</string>
+    <string name="details_footer">This build discovers and validates devices. Screen mirroring arrives in the streaming milestone.</string>
+
+    <string name="issue_title">%1$s discovery issue</string>
+    <string name="issue_chromecast_hint">Chromecast discovery uses mDNS. Check that the phone is on Wi-Fi and that the network allows multicast.</string>
+    <string name="issue_roku_hint">Roku discovery uses SSDP multicast. Guest, isolated, or VPN networks may block it.</string>
+
+    <string name="discovery_runs_automatically">Discovery runs automatically while this screen is open.</string>
+    <string name="content_desc_protocol_icon">%1$s device</string>
+</resources>
