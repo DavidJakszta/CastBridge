@@ -1,5 +1,11 @@
 package dev.castbridge.app.ui.devices
 
+import android.Manifest
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -37,11 +43,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -77,6 +85,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -84,11 +93,16 @@ import dev.castbridge.app.CastBridgeApplication
 import dev.castbridge.app.R
 import dev.castbridge.app.ui.components.ProtocolBadge
 import dev.castbridge.app.ui.theme.CastBridgeTheme
+import dev.castbridge.core.capture.CaptureConfigFactory
+import dev.castbridge.core.capture.CaptureFormat
+import dev.castbridge.core.capture.CaptureState
+import dev.castbridge.core.capture.ScreenCaptureRequest
 import dev.castbridge.core.model.CastDevice
 import dev.castbridge.core.model.CastProtocol
 import dev.castbridge.core.model.ChromecastDevice
 import dev.castbridge.core.model.DiscoveryIssue
 import dev.castbridge.core.model.RokuDevice
+import java.io.File
 
 @Composable
 fun DeviceListRoute() {
@@ -126,6 +140,41 @@ fun DeviceListRoute() {
     var detailsDeviceId by rememberSaveable { mutableStateOf<String?>(null) }
     val detailsDevice = state.allDevices.firstOrNull { it.id == detailsDeviceId }
 
+    val captureConfig = remember(context) {
+        CaptureConfigFactory.forDisplay(context.resources.displayMetrics)
+    }
+
+    val captureLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == Activity.RESULT_OK && data != null) {
+            viewModel.startCapture(result.resultCode, data, captureConfig)
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        // The ongoing notification is helpful but not required for capture to work.
+        captureLauncher.launch(ScreenCaptureRequest.intent(context))
+    }
+
+    val onStartCapture: () -> Unit = {
+        val needsNotificationPermission =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                ) != PackageManager.PERMISSION_GRANTED
+
+        if (needsNotificationPermission) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            captureLauncher.launch(ScreenCaptureRequest.intent(context))
+        }
+    }
+
     DeviceListScreen(
         state = state,
         snackbarHostState = snackbarHostState,
@@ -133,6 +182,9 @@ fun DeviceListRoute() {
         onFilterSelected = viewModel::selectFilter,
         onShowDetails = { device -> detailsDeviceId = device.id },
         onTestConnection = viewModel::testConnection,
+        onStartCapture = onStartCapture,
+        onStopCapture = viewModel::stopCapture,
+        onDismissCapture = viewModel::dismissCaptureResult,
     )
 
     detailsDevice?.let { device ->
@@ -154,6 +206,9 @@ internal fun DeviceListScreen(
     onFilterSelected: (DeviceFilter) -> Unit,
     onShowDetails: (CastDevice) -> Unit,
     onTestConnection: (String) -> Unit,
+    onStartCapture: () -> Unit,
+    onStopCapture: () -> Unit,
+    onDismissCapture: () -> Unit,
 ) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -188,6 +243,15 @@ internal fun DeviceListScreen(
         ) {
             item(key = "header") {
                 DeviceListHeader(state)
+            }
+
+            item(key = "capture") {
+                CaptureCard(
+                    state = state.capture,
+                    onStart = onStartCapture,
+                    onStop = onStopCapture,
+                    onDismiss = onDismissCapture,
+                )
             }
 
             if (state.allDevices.any { it.protocol == CastProtocol.GOOGLE_CAST } &&
@@ -373,6 +437,264 @@ private fun FilterRow(
             selected = selected == DeviceFilter.ROKU,
             onClick = { onSelected(DeviceFilter.ROKU) },
             label = { Text(stringResource(R.string.filter_roku)) },
+        )
+    }
+}
+
+@Composable
+private fun CaptureCard(
+    state: CaptureState,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
+        tonalElevation = 1.dp,
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_record),
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.capture_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = stringResource(R.string.capture_subtitle),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (state is CaptureState.Running) {
+                    RecordingPill()
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            when (state) {
+                CaptureState.Idle -> {
+                    Text(
+                        text = stringResource(R.string.capture_idle_body),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = onStart,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_record),
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.capture_start))
+                    }
+                }
+
+                CaptureState.Preparing -> CaptureProgress(stringResource(R.string.capture_preparing))
+
+                CaptureState.Finalizing -> CaptureProgress(stringResource(R.string.capture_finalizing))
+
+                is CaptureState.Running -> {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    ) {
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_elapsed),
+                            value = CaptureFormat.elapsed(state.stats.elapsedMillis),
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_resolution),
+                            value = CaptureFormat.resolution(state.stats.width, state.stats.height),
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_size),
+                            value = CaptureFormat.bytes(state.stats.bytes),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    OutlinedButton(
+                        onClick = onStop,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_stop),
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.capture_stop))
+                    }
+                }
+
+                is CaptureState.Completed -> {
+                    val result = state.result
+                    Text(
+                        text = stringResource(
+                            R.string.capture_saved,
+                            File(result.filePath).name,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    ) {
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_duration),
+                            value = CaptureFormat.elapsed(result.durationMillis),
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_resolution),
+                            value = CaptureFormat.resolution(result.width, result.height),
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_size),
+                            value = CaptureFormat.bytes(result.sizeBytes),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                        ) {
+                            Text(stringResource(R.string.capture_dismiss))
+                        }
+                        Button(
+                            onClick = onStart,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                        ) {
+                            Text(stringResource(R.string.capture_record_again))
+                        }
+                    }
+                }
+
+                is CaptureState.Failed -> {
+                    Text(
+                        text = state.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = onStart,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                    ) {
+                        Text(stringResource(R.string.capture_retry))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CaptureProgress(label: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(18.dp),
+            strokeWidth = 2.dp,
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun CaptureStat(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier = modifier) {
+        Text(
+            text = label.uppercase(),
+            style = MaterialTheme.typography.labelSmall,
+            letterSpacing = 0.8.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun RecordingPill() {
+    val transition = rememberInfiniteTransition(label = "recordingPill")
+    val alpha by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
+        label = "recordingPulse",
+    )
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .background(MaterialTheme.colorScheme.error.copy(alpha = alpha), CircleShape),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = stringResource(R.string.capture_live),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp,
+            color = MaterialTheme.colorScheme.error,
         )
     }
 }
@@ -792,6 +1114,9 @@ private fun DeviceListPopulatedPreview() {
             onFilterSelected = {},
             onShowDetails = {},
             onTestConnection = {},
+            onStartCapture = {},
+            onStopCapture = {},
+            onDismissCapture = {},
         )
     }
 }
@@ -807,6 +1132,9 @@ private fun DeviceListEmptyPreview() {
             onFilterSelected = {},
             onShowDetails = {},
             onTestConnection = {},
+            onStartCapture = {},
+            onStopCapture = {},
+            onDismissCapture = {},
         )
     }
 }

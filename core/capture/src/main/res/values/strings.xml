@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capture_notification_channel">Screen capture</string>
+    <string name="capture_notification_channel_description">Shown while CastBridge records your screen.</string>
+    <string name="capture_notification_title">Recording your screen</string>
+    <string name="capture_notification_text">CastBridge is capturing and encoding your screen.</string>
+    <string name="capture_notification_stop">Stop</string>
+
+    <string name="capture_error_permission">Screen capture permission was not granted.</string>
+    <string name="capture_error_projection">Could not start screen capture.</string>
+    <string name="capture_error_foreground">Android blocked the capture service from starting.</string>
+    <string name="capture_error_timeout">The encoder did not stop in time.</string>
+</resources>

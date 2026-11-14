@@ -1,11 +1,15 @@
 package dev.castbridge.app.ui.devices
 
+import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.castbridge.app.di.AppContainer
+import dev.castbridge.core.capture.CaptureConfig
+import dev.castbridge.core.capture.CaptureController
+import dev.castbridge.core.capture.CaptureState
 import dev.castbridge.core.discovery.repository.DeviceDiscoveryRepository
 import dev.castbridge.core.model.CastDevice
 import dev.castbridge.core.model.CastProtocol
@@ -44,6 +48,7 @@ data class DeviceListUiState(
     val issues: List<DiscoveryIssue> = emptyList(),
     val completedCycles: Int = 0,
     val probe: ProbeUiState = ProbeUiState(),
+    val capture: CaptureState = CaptureState.Idle,
 )
 
 sealed interface DeviceListEvent {
@@ -55,6 +60,7 @@ sealed interface DeviceListEvent {
 class DeviceListViewModel(
     private val repository: DeviceDiscoveryRepository,
     private val deviceProbe: DeviceProbe,
+    private val captureController: CaptureController,
 ) : ViewModel() {
 
     private val selectedDeviceId = MutableStateFlow<String?>(null)
@@ -70,7 +76,8 @@ class DeviceListViewModel(
         selectedDeviceId,
         filter,
         probeState,
-    ) { discovery, selectedId, activeFilter, probe ->
+        captureController.state,
+    ) { discovery, selectedId, activeFilter, probe, capture ->
         val selected = discovery.devices.firstOrNull { it.id == selectedId }
         val visible = when (activeFilter) {
             DeviceFilter.ALL -> discovery.devices
@@ -92,6 +99,7 @@ class DeviceListViewModel(
             issues = discovery.issues,
             completedCycles = discovery.completedCycles,
             probe = probe,
+            capture = capture,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -150,6 +158,18 @@ class DeviceListViewModel(
         }
     }
 
+    fun startCapture(resultCode: Int, data: Intent, config: CaptureConfig) {
+        captureController.start(resultCode, data, config)
+    }
+
+    fun stopCapture() {
+        captureController.stop()
+    }
+
+    fun dismissCaptureResult() {
+        captureController.reset()
+    }
+
     override fun onCleared() {
         probeJob?.cancel()
         repository.stopScanning()
@@ -162,6 +182,7 @@ class DeviceListViewModel(
                 DeviceListViewModel(
                     repository = container.deviceRepository,
                     deviceProbe = container.deviceProbe,
+                    captureController = container.captureController,
                 )
             }
         }

@@ -1,21 +1,22 @@
 # CastBridge
 
 A universal Android casting app for Chromecast and Roku. This repository currently implements
-**Milestone 1**: reliable local-network discovery of Google Cast and Roku devices in one unified,
-selectable device list.
+**Milestones 1–2**: reliable local-network discovery of Google Cast and Roku devices in one
+unified, selectable device list, plus screen capture and a hardware H.264 encoder that records to
+an MP4.
 
 ## Current status
 
 | Milestone | Status |
 | --- | --- |
 | 1. Project, architecture, unified device discovery | ✅ Implemented |
-| 2. Screen / app-window capture | ⏳ Next |
-| 3. Video encoding and low-latency streaming | ⏳ Planned |
+| 2. Screen / app-window capture and encoder pipeline | ✅ Implemented (local MP4) |
+| 3. Low-latency streaming transport | ⏳ Next |
 | 4. Chromecast and Roku receiver apps | ⏳ Planned |
 
-The app deliberately does **not** include a Cast SDK session or streaming code yet. Discovery,
-device identity, stale-device handling, and reachability checks are in place so the streaming layer
-can be built on a stable foundation.
+The app deliberately does **not** include a Cast SDK session or a streaming transport yet.
+Discovery, device identity, stale-device handling, reachability checks, screen capture, and H.264
+encoding are in place so the streaming layer can be built on a tested foundation.
 
 ## Features
 
@@ -32,10 +33,16 @@ can be built on a stable foundation.
 - Reports per-protocol discovery problems with troubleshooting hints.
 - Shows device name, model, address, protocol-specific details, and selection state.
 - Verifies reachability on demand (Roku ECP HTTP or Chromecast TCP port 8009).
+- Captures the screen through `MediaProjection` and encodes H.264 with a hardware `MediaCodec`
+  surface, recording to an MP4 for validation.
+- On Android 14+ the consent dialog offers the system's **single app** or **entire screen** capture
+  mode.
+- Runs capture in a media-projection foreground service, so recording continues while you switch
+  apps, with a notification that stops the session.
 - Material 3 Compose UI with light/dark themes, filters, empty states, and animated radar.
 
-No runtime permissions are required for discovery. No backend, account, analytics, or cloud service
-is used.
+No runtime permissions are required for discovery. The notification permission is requested only
+when you start a recording. No backend, account, analytics, or cloud service is used.
 
 ## Architecture
 
@@ -49,13 +56,18 @@ is used.
     │     DeviceDiscoveryRepository ── parallel scans, merge, prune, health
     │     DefaultDeviceProbe ─── reachability checks
     │
+    ├── :core:capture (Android library)
+    │     ScreenCaptureService ── media-projection foreground service
+    │     H264ScreenRecorder ─── MediaCodec surface encoder + MediaMuxer
+    │     CaptureStore ───────── process-wide capture state
+    │
     └── :core:model (pure Kotlin)
           CastDevice, ChromecastDevice, RokuDevice
           DeviceDiscovery, DeviceProbe, DiscoveryState
 ```
 
-- **MVVM:** `DeviceListViewModel` combines repository state, selection, filters, and probe state into
-  one immutable UI state. The Compose screen is stateless and receives callbacks.
+- **MVVM:** `DeviceListViewModel` combines repository state, selection, filters, probe state, and
+  capture state into one immutable UI state. The Compose screen is stateless and receives callbacks.
 - **Common device interface:** `CastDevice` lets the UI and future connection layer treat Chromecast
   and Roku uniformly. Protocol-specific data stays in `ChromecastDevice` / `RokuDevice`.
 - **Discovery transports stay separate:** each implements `DeviceDiscovery.scan(timeoutMillis)`.
@@ -111,6 +123,30 @@ If SSDP returns nothing, the scan falls back to mDNS:
    succeeded but returned nothing, a silent empty result is returned and the repository keeps
    previously seen devices for one more cycle.
 
+## How screen capture works
+
+1. The UI asks Android for capture consent with `MediaProjectionManager`. On Android 14+ the system
+   dialog lets the user share the entire screen or a single app window.
+2. The consent result is handed to `ScreenCaptureService`, a foreground service of type
+   `mediaProjection`. Android 14+ requires the service to be in the foreground before
+   `getMediaProjection()` is called, so the notification is posted first.
+3. `CaptureConfigFactory` derives encoder settings from the current display: the long edge is capped
+   at 1920 px, the aspect ratio is preserved, both dimensions are rounded to even numbers, and the
+   bitrate is scaled from the pixel count (1.5–12 Mbps). The size is fixed for the session because a
+   surface-backed encoder cannot change resolution without a restart.
+4. `H264ScreenRecorder` configures a hardware H.264 `MediaCodec` encoder with
+   `COLOR_FormatSurface`, creates its input surface, and mirrors the display into it with a
+   `VirtualDisplay`. Frames are encoded on the GPU/encoder path and never copied through the CPU.
+5. Encoded access units are muxed into an MP4 with `MediaMuxer` in the app-specific
+   `Movies/captures` directory, so no storage permission is needed.
+6. Stopping the session (UI button, notification action, or the system stop control) signals
+   end-of-stream, drains the remaining frames, closes the container, and reads the duration and
+   dimensions back with `MediaMetadataRetriever`.
+
+The capture pipeline publishes live stats (elapsed time, resolution, bytes) through `CaptureStore`,
+a process-wide `StateFlow`, so the UI and the service stay in sync across activity recreation. A
+session is capped at 30 minutes to bound file size and encoder uptime.
+
 ## Requirements
 
 - Android Studio Ladybug or newer (or a JDK 17 + Android SDK command-line setup)
@@ -127,6 +163,9 @@ If SSDP returns nothing, the scan falls back to mDNS:
 # JVM unit tests (SSDP/ECP/TXT parsers, registry, scan orchestration)
 ./gradlew :core:discovery:testDebugUnitTest
 
+# Capture sizing, formatting, naming, and config tests
+./gradlew :core:capture:testDebugUnitTest
+
 # All checks
 ./gradlew build
 ```
@@ -142,9 +181,15 @@ On Windows use `gradlew.bat`. The debug APK is written to
 | `ACCESS_NETWORK_STATE` | Network availability |
 | `ACCESS_WIFI_STATE` | Multicast lock |
 | `CHANGE_WIFI_MULTICAST_STATE` | Receive SSDP traffic on Android |
+| `FOREGROUND_SERVICE` | Keep the capture session alive while you use other apps |
+| `FOREGROUND_SERVICE_MEDIA_PROJECTION` | Required foreground service type for screen capture (Android 14+) |
+| `POST_NOTIFICATIONS` | Show the ongoing recording notification (requested at first recording, Android 13+) |
 
-All are normal permissions; the app has no runtime permission prompt. `usesCleartextTraffic` is
-enabled because Roku ECP is a local HTTP API on port 8060. No internet server is contacted.
+All discovery permissions are normal permissions and are granted at install time. Screen capture is
+authorized by the Android system consent dialog, not a manifest permission; the app can never start
+capturing without that explicit approval, and the system's own stop control remains available.
+`usesCleartextTraffic` is enabled because Roku ECP is a local HTTP API on port 8060. No internet
+server is contacted.
 
 ## Troubleshooting discovery
 
@@ -164,6 +209,21 @@ enabled because Roku ECP is a local HTTP API on port 8060. No internet server is
 - **Device disappears:** it was missing from two consecutive successful scans. Reconnect it to the
   network; it will be rediscovered automatically.
 
+## Troubleshooting capture
+
+- **The consent dialog does not appear:** unlock the phone and keep CastBridge in the foreground
+  while tapping *Start recording*. Android will not show a projection prompt for a background app.
+- **"Screen capture could not be started":** some devices restrict the media-projection foreground
+  service (battery savers, device-admin policies, or a work profile). Check the notification
+  permission and try again from the main user profile.
+- **The recording is black:** protected content (banking apps, DRM video) is blanked by the OS. That
+  is expected and is not bypassed by CastBridge.
+- **No file appears:** recordings are stored in the app-specific
+  `Android/data/dev.castbridge.app/files/Movies/captures/` directory. Uninstalling the app removes
+  them. The Completed card shows the exact file name, duration, resolution, and size.
+- **Recording stops early:** a session is limited to 30 minutes, and Android stops projection if the
+  consent is revoked from the system UI or the quick-settings tile.
+
 ## Testing
 
 Unit tests cover:
@@ -175,14 +235,17 @@ Unit tests cover:
 - Chromecast TXT parsing and name derivation.
 - Unified registry merge, sorting, two-miss removal, reappearance, and per-protocol isolation.
 - Repository parallel scans, incremental publication, issue reporting/recovery, and cancellation.
+- Capture size scaling, even-dimension rounding, bitrate clamping, and frame-rate selection.
+- Capture config validation, timestamped file naming, and locale-independent stat formatting.
 
-Discovery transports themselves need a real device or a virtual network with multicast support;
-there is no emulator shortcut for SSDP/mDNS visibility.
+Discovery transports and the encoder need a real device or a virtual network with multicast support;
+there is no emulator shortcut for SSDP/mDNS visibility or hardware H.264 encoding.
 
 ## Privacy and safety
 
 - No DRM circumvention and no attempt to bypass OS capture restrictions.
 - No data leaves the local network in this milestone.
+- Recordings stay in app-specific storage on the phone; nothing is uploaded.
 - Roku XML parsing disables DOCTYPEs and external entities.
 - Device details are read-only; the reachability probe sends no cast or control command.
 
@@ -207,7 +270,13 @@ from the author.
 
 ## Next step
 
-Milestone 2 adds `MediaProjection` capture (entire screen, then Android 14 app-window capture) and
-the encoder pipeline. Before committing to WebRTC vs. HLS for Roku, validate receiver compatibility:
-Chromecast requires a registered Web Receiver application for custom streams, while Roku needs an
-HLS/H.264 playback channel with sufficient buffering for low-latency mirroring.
+Milestone 3 adds the low-latency streaming transport on top of the encoder surface:
+
+- Reuse the H.264 `MediaCodec` output as a live stream instead of muxing it to a file.
+- Evaluate WebRTC for Chromecast (custom Web Receiver) and an HLS or progressive-HTTP path for Roku.
+- Keep the receiver side minimal and local: no account, no cloud relay, no DRM circumvention.
+
+Before committing to a transport, validate receiver compatibility on real hardware: Chromecast
+requires a registered Web Receiver application for custom streams, while Roku needs a playback
+channel that can sustain low-latency H.264. Roku TVs must also allow mobile control
+(*Settings → System → Advanced system settings → Control by mobile apps → Network access*).

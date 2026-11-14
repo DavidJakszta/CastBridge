@@ -24,3 +24,4 @@ rootProject.name = "CastBridge"
 include(":app")
 include(":core:model")
 include(":core:discovery")
+include(":core:capture")

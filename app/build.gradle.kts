@@ -12,8 +12,8 @@ android {
         applicationId = "dev.castbridge.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -56,6 +56,7 @@ kotlin {
 dependencies {
     implementation(project(":core:model"))
     implementation(project(":core:discovery"))
+    implementation(project(":core:capture"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)

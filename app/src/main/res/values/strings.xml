@@ -49,4 +49,21 @@
 
     <string name="discovery_runs_automatically">Discovery runs automatically while this screen is open.</string>
     <string name="content_desc_protocol_icon">%1$s device</string>
+
+    <string name="capture_title">Screen capture</string>
+    <string name="capture_subtitle">Validate the encoder that will feed your TV.</string>
+    <string name="capture_idle_body">Records this screen to an MP4 on your phone. Streaming to Chromecast and Roku arrives in the next milestone.</string>
+    <string name="capture_start">Start recording</string>
+    <string name="capture_preparing">Starting capture…</string>
+    <string name="capture_finalizing">Finishing recording…</string>
+    <string name="capture_stop">Stop recording</string>
+    <string name="capture_live">REC</string>
+    <string name="capture_stat_elapsed">Elapsed</string>
+    <string name="capture_stat_resolution">Resolution</string>
+    <string name="capture_stat_size">Size</string>
+    <string name="capture_stat_duration">Duration</string>
+    <string name="capture_saved">Saved %1$s</string>
+    <string name="capture_record_again">Record again</string>
+    <string name="capture_dismiss">Dismiss</string>
+    <string name="capture_retry">Try again</string>
 </resources>
