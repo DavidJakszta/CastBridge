@@ -186,6 +186,25 @@ there is no emulator shortcut for SSDP/mDNS visibility.
 - Roku XML parsing disables DOCTYPEs and external entities.
 - Device details are read-only; the reachability probe sends no cast or control command.
 
+## License
+
+CastBridge is **source-available**, not open source. It is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE), with this Required Notice:
+
+> Required Notice: Copyright David Jakszta (https://github.com/DavidJakszta)
+
+| Use | Allowed? |
+| --- | --- |
+| The author uses the software commercially | Yes (the author retains all rights) |
+| Others use it for personal projects | Yes |
+| Others modify the source code | Yes |
+| Others redistribute modified versions | Yes, under the same license and notices |
+| Others sell the software | No |
+| Others use it commercially | No |
+
+Any commercial use by anyone other than the copyright holder requires a separate written license
+from the author.
+
 ## Next step
 
 Milestone 2 adds `MediaProjection` capture (entire screen, then Android 14 app-window capture) and
