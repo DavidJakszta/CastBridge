@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -102,9 +103,26 @@ class CastV2ClientTest {
         active.connect()
         active.launchReceiver()
 
-        device.push(CastMessage.NS_CONNECTION, """{"type":"CLOSE"}""")
+        device.push(CastMessage.NS_CONNECTION, """{"type":"CLOSE"}""", sourceId = "receiver-0")
 
         awaitTrue("the peer to close the connection") { active.isClosedByPeer() }
+    }
+
+    @Test
+    fun `treats a closed app connection as a takeover, not a dead device`() {
+        val device = FakeCastDevice().also { server = it }
+        val active = CastV2Client("127.0.0.1", device.port, plainSocketFactory).also { client = it }
+
+        active.connect()
+        val app = active.launchReceiver()
+        active.load(app.transportId, STREAM_URL)
+
+        // Another sender replaced the receiver app: its transport connection closes, but the TCP
+        // connection to the device stays open.
+        device.push(CastMessage.NS_CONNECTION, """{"type":"CLOSE"}""", sourceId = app.transportId)
+
+        awaitTrue("the receiver app to be forgotten") { active.receiverStatus() == null }
+        assertFalse(active.isClosedByPeer())
     }
 
     @Test
@@ -136,6 +154,8 @@ class CastV2ClientTest {
         assertEquals("PLAYING", loaded.media.playerState)
         // The stuck app was replaced by a fresh one before the stream was accepted.
         assertTrue(loaded.app.sessionId != app.sessionId)
+        // A restarted receiver reuses media session ids; the retry's status must not be discarded.
+        assertEquals(REJECTED_SESSION, loaded.media.mediaSessionId)
         assertEquals(2, device.loadCount)
         assertEquals(2, device.launchCount)
     }
@@ -178,8 +198,11 @@ private fun mediaStatus(sessionId: Long = 7, state: String = "PLAYING"): String 
         """"playerState":"$state","idleReason":null,"media":{"contentId":"$STREAM_URL",""" +
         """"streamType":"LIVE","contentType":"application/x-mpegURL"}}]}"""
 
-/** A media session id used by the fake receiver for loads it rejects. */
-private const val REJECTED_SESSION = 99L
+/**
+ * The media session id the fake receiver reports. A restarted Default Media Receiver reuses the
+ * same numbering, so a rejected load and the load that follows a restart both use [REJECTED_SESSION].
+ */
+private const val REJECTED_SESSION = 7L
 
 private class FakeCastDevice(
     private val loadResponse: String? = null,
@@ -251,15 +274,6 @@ private class FakeCastDevice(
                             """"playerState":"IDLE","idleReason":"ERROR"}]}""",
                     )
                 } else {
-                    if (attempt > 0) {
-                        // A late broadcast for the rejected session, delivered just before the
-                        // retry's result. Without filtering it would be read as a failed retry.
-                        push(
-                            CastMessage.NS_MEDIA,
-                            """{"type":"MEDIA_STATUS","status":[{"mediaSessionId":$REJECTED_SESSION,""" +
-                                """"playerState":"IDLE","idleReason":"ERROR"}]}""",
-                        )
-                    }
                     push(CastMessage.NS_MEDIA, loadResponse ?: mediaStatus())
                 }
             }
@@ -271,11 +285,11 @@ private class FakeCastDevice(
         }
     }
 
-    fun push(namespace: String, payload: String) {
+    fun push(namespace: String, payload: String, sourceId: String = "receiver-0") {
         val stream = output.get() ?: return
         val encoded = CastMessageCodec.encode(
             CastMessage(
-                sourceId = "receiver-0",
+                sourceId = sourceId,
                 destinationId = "sender-0",
                 namespace = namespace,
                 payloadUtf8 = payload,

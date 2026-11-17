@@ -8,7 +8,6 @@ import java.io.DataInputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.net.Socket
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -85,13 +84,6 @@ internal class CastV2Client(
 
     @Volatile
     private var lastError: String? = null
-
-    /**
-     * Media session ids from earlier LOAD attempts. The receiver keeps broadcasting the state of a
-     * rejected session for a moment, and those late messages must not be mistaken for the result of
-     * the next attempt. Written by the load thread, read by the reader thread.
-     */
-    private val retiredMediaSessions = ConcurrentHashMap.newKeySet<Long>()
 
     private var socket: Socket? = null
     private var output: OutputStream? = null
@@ -208,8 +200,6 @@ internal class CastV2Client(
                 "MEDIA_STATUS" -> {
                     val status = parseMediaStatus(payload)
                     if (status != null) {
-                        // A session we already abandoned can keep broadcasting for a moment.
-                        if (status.mediaSessionId in retiredMediaSessions) continue
                         mediaStatus = status
                         if (status.playerState == "PLAYING" || status.playerState == "BUFFERING") {
                             return status
@@ -248,7 +238,6 @@ internal class CastV2Client(
     ): LoadedMedia {
         var current = app
         var lastError: CastProtocolException? = null
-        retiredMediaSessions.clear()
 
         for (attempt in 1..LOAD_ATTEMPTS) {
             try {
@@ -257,7 +246,6 @@ internal class CastV2Client(
                 lastError = error
                 if (attempt >= LOAD_ATTEMPTS) break
                 log("LOAD attempt $attempt failed (${error.message}); restarting the receiver")
-                mediaStatus?.mediaSessionId?.takeIf { it > 0 }?.let { retiredMediaSessions += it }
                 current = restartReceiver(current)
             }
         }
@@ -372,7 +360,15 @@ internal class CastV2Client(
 
             CastMessage.NS_CONNECTION -> {
                 if (message.payloadUtf8?.contains("\"CLOSE\"") == true) {
-                    closedByPeer = true
+                    if (message.sourceId == RECEIVER_ID) {
+                        // The device closed the sender's connection to the receiver itself.
+                        closedByPeer = true
+                    } else {
+                        // The receiver app on a transport connection closed, which is what happens
+                        // when another sender replaces it. That is a takeover, not a dead device, so
+                        // the cached app is dropped and the monitor reports it on its next poll.
+                        receiverStatus = null
+                    }
                 }
             }
 
