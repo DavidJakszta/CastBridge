@@ -1,0 +1,8 @@
+title=CastBridge
+subtitle=Play the live stream from your phone
+major_version=1
+minor_version=0
+build_version=1
+ui_resolutions=hd
+supports_input_launch=1
+mm_icon_focus_hd=pkg:/images/icon_hd.png

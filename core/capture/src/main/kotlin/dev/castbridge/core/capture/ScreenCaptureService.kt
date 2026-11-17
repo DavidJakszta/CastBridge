@@ -20,10 +20,17 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
+import dev.castbridge.core.streaming.HlsStreamingSession
+import dev.castbridge.core.streaming.StreamingMetadata
+import dev.castbridge.core.streaming.StreamingState
+import dev.castbridge.core.streaming.StreamingStore
+import dev.castbridge.core.streaming.MediaSampleSink
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -32,13 +39,16 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Android 14+ requires the media-projection foreground service to be running *before*
  * `getMediaProjection()` is called, so the service starts its notification first and only then
- * obtains the projection token.
+ * obtains the projection token. The same service hosts either an MP4 recording or a live HLS
+ * session; the two modes share the encoder pipeline.
  */
 class ScreenCaptureService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private var recorder: H264ScreenRecorder? = null
+    private var streamingSession: HlsStreamingSession? = null
+    private var mode = CaptureMode.RECORD
     private var projection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var projectionStopped = false
@@ -61,6 +71,7 @@ class ScreenCaptureService : Service() {
             return
         }
 
+        mode = intent.toCaptureMode()
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
         val permissionData = IntentCompat.getParcelableExtra(
             intent,
@@ -74,7 +85,11 @@ class ScreenCaptureService : Service() {
             return
         }
 
-        CaptureStore.update(CaptureState.Preparing)
+        if (mode == CaptureMode.STREAM) {
+            StreamingStore.update(StreamingState.Preparing)
+        } else {
+            CaptureStore.update(CaptureState.Preparing)
+        }
         startForegroundInternal()
         if (finishing) return
 
@@ -103,12 +118,47 @@ class ScreenCaptureService : Service() {
         projection = mediaProjection
         projectionCallback = callback
 
-        val outputFile = RecordingFiles.createOutputFile(this, System.currentTimeMillis())
+        val outputFile: File?
+        val streamSink: MediaSampleSink?
+        if (mode == CaptureMode.STREAM) {
+            val session = try {
+                HlsStreamingSession(
+                    metadata = StreamingMetadata(
+                        width = config.width,
+                        height = config.height,
+                        frameRate = config.frameRate,
+                        bitrate = config.bitrate,
+                    ),
+                    log = { message -> Log.d(STREAM_TAG, message) },
+                ).also { it.start() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not start the HLS streaming session", e)
+                null
+            }
+
+            if (session == null) {
+                fail(getString(R.string.capture_error_stream))
+                return
+            }
+
+            streamingSession = session
+            outputFile = null
+            streamSink = session
+        } else {
+            outputFile = RecordingFiles.createOutputFile(this, System.currentTimeMillis())
+            streamSink = null
+        }
+
         val activeRecorder = H264ScreenRecorder(
             projection = mediaProjection,
             config = config,
             outputFile = outputFile,
-            onStats = { stats -> CaptureStore.update(CaptureState.Running(stats)) },
+            streamSink = streamSink,
+            onStats = { stats ->
+                if (mode == CaptureMode.RECORD) {
+                    CaptureStore.update(CaptureState.Running(stats))
+                }
+            },
         )
         recorder = activeRecorder
         activeRecorder.start()
@@ -117,12 +167,29 @@ class ScreenCaptureService : Service() {
             val outcome = activeRecorder.outcome.await()
             complete(outcome)
         }
+
+        if (mode == CaptureMode.STREAM) {
+            // A capture that never delivers a frame (for example "Share one app" while that app is
+            // in the background) would otherwise leave the UI on "Starting stream" forever.
+            scope.launch {
+                delay(PREPARING_TIMEOUT_MS)
+                if (!finishing && StreamingStore.state.value is StreamingState.Preparing) {
+                    fail(getString(R.string.capture_error_no_frames))
+                }
+            }
+        }
     }
 
     private fun handleStop() {
         val activeRecorder = recorder
         if (activeRecorder == null) {
-            if (CaptureStore.state.value is CaptureState.Preparing) {
+            if (mode == CaptureMode.STREAM) {
+                if (StreamingStore.state.value is StreamingState.Preparing) {
+                    fail(getString(R.string.capture_error_projection))
+                } else {
+                    stopSelf()
+                }
+            } else if (CaptureStore.state.value is CaptureState.Preparing) {
                 fail(getString(R.string.capture_error_projection))
             } else {
                 stopSelf()
@@ -130,7 +197,13 @@ class ScreenCaptureService : Service() {
             return
         }
 
-        if (!finishing) CaptureStore.update(CaptureState.Finalizing)
+        if (!finishing) {
+            if (mode == CaptureMode.STREAM) {
+                StreamingStore.update(StreamingState.Stopping)
+            } else {
+                CaptureStore.update(CaptureState.Finalizing)
+            }
+        }
         activeRecorder.requestStop()
 
         scope.launch {
@@ -138,7 +211,7 @@ class ScreenCaptureService : Service() {
             if (finished == null && !finishing) {
                 Log.w(TAG, "Encoder did not stop within $STOP_TIMEOUT_MS ms")
                 complete(
-                    RecordingOutcome.Failure(
+                    CaptureOutcome.Failure(
                         message = getString(R.string.capture_error_timeout),
                         cause = null,
                     ),
@@ -147,29 +220,49 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    private fun complete(outcome: RecordingOutcome) {
+    private fun complete(outcome: CaptureOutcome) {
         if (finishing) return
         finishing = true
 
-        val nextState = when (outcome) {
-            is RecordingOutcome.Success -> {
-                val summary = RecordingFiles.summarize(outcome.result)
-                Log.i(
-                    TAG,
-                    "Recording saved: ${summary.filePath} " +
-                        "(${summary.durationMillis} ms, ${summary.width}x${summary.height}, " +
-                        "${summary.sizeBytes} bytes, ${summary.frameCount} frames)",
-                )
-                CaptureState.Completed(summary)
+        when (outcome) {
+            is CaptureOutcome.Success -> {
+                if (mode == CaptureMode.STREAM) {
+                    Log.i(
+                        TAG,
+                        "Stream finished: ${outcome.stats.frames} frames, " +
+                            "${outcome.stats.bytes} bytes",
+                    )
+                } else {
+                    val recording = outcome.recording
+                    if (recording == null) {
+                        Log.w(TAG, "Recording finished without a file")
+                        CaptureStore.update(
+                            CaptureState.Failed(getString(R.string.capture_error_projection)),
+                        )
+                    } else {
+                        val summary = RecordingFiles.summarize(recording)
+                        Log.i(
+                            TAG,
+                            "Recording saved: ${summary.filePath} " +
+                                "(${summary.durationMillis} ms, ${summary.width}x${summary.height}, " +
+                                "${summary.sizeBytes} bytes, ${summary.frameCount} frames)",
+                        )
+                        CaptureStore.update(CaptureState.Completed(summary))
+                    }
+                }
             }
 
-            is RecordingOutcome.Failure -> {
-                Log.w(TAG, "Recording failed: ${outcome.message}", outcome.cause)
-                CaptureState.Failed(outcome.message)
+            is CaptureOutcome.Failure -> {
+                Log.w(TAG, "Capture failed: ${outcome.message}", outcome.cause)
+                if (mode == CaptureMode.STREAM) {
+                    streamingSession?.close()
+                    StreamingStore.update(StreamingState.Failed(outcome.message))
+                } else {
+                    CaptureStore.update(CaptureState.Failed(outcome.message))
+                }
             }
         }
 
-        CaptureStore.update(nextState)
         cleanup()
         stopForegroundAndSelf()
     }
@@ -178,12 +271,20 @@ class ScreenCaptureService : Service() {
         if (finishing) return
         finishing = true
         Log.w(TAG, message)
-        CaptureStore.update(CaptureState.Failed(message))
+        if (mode == CaptureMode.STREAM) {
+            streamingSession?.close()
+            StreamingStore.update(StreamingState.Failed(message))
+        } else {
+            CaptureStore.update(CaptureState.Failed(message))
+        }
         cleanup()
         stopForegroundAndSelf()
     }
 
     private fun cleanup() {
+        streamingSession?.close()
+        streamingSession = null
+
         projectionCallback?.let { callback ->
             runCatching { projection?.unregisterCallback(callback) }
         }
@@ -237,16 +338,43 @@ class ScreenCaptureService : Service() {
             )
         }
 
+        val streaming = mode == CaptureMode.STREAM
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_capture_notification)
-            .setContentTitle(getString(R.string.capture_notification_title))
-            .setContentText(getString(R.string.capture_notification_text))
+            .setContentTitle(
+                getString(
+                    if (streaming) {
+                        R.string.capture_notification_title_stream
+                    } else {
+                        R.string.capture_notification_title
+                    },
+                ),
+            )
+            .setContentText(
+                getString(
+                    if (streaming) {
+                        R.string.capture_notification_text_stream
+                    } else {
+                        R.string.capture_notification_text
+                    },
+                ),
+            )
             .setOngoing(true)
             .setSilent(true)
             .setShowWhen(false)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(contentIntent)
-            .addAction(0, getString(R.string.capture_notification_stop), stopIntent)
+            .addAction(
+                0,
+                getString(
+                    if (streaming) {
+                        R.string.capture_notification_stop_stream
+                    } else {
+                        R.string.capture_notification_stop
+                    },
+                ),
+                stopIntent,
+            )
             .build()
     }
 
@@ -267,7 +395,9 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        finishing = true
         scope.cancel()
+        streamingSession?.close()
         recorder?.requestStop()
         cleanup()
         super.onDestroy()
@@ -283,8 +413,13 @@ class ScreenCaptureService : Service() {
         )
     }.getOrNull()
 
+    private fun Intent.toCaptureMode(): CaptureMode = runCatching {
+        CaptureMode.valueOf(getStringExtra(EXTRA_MODE) ?: CaptureMode.RECORD.name)
+    }.getOrDefault(CaptureMode.RECORD)
+
     companion object {
         private const val TAG = "ScreenCaptureService"
+        private const val STREAM_TAG = "HlsStreaming"
         private const val ACTION_START = "dev.castbridge.core.capture.action.START"
         private const val ACTION_STOP = "dev.castbridge.core.capture.action.STOP"
 
@@ -295,14 +430,22 @@ class ScreenCaptureService : Service() {
         private const val EXTRA_DENSITY = "extra_density"
         private const val EXTRA_FRAME_RATE = "extra_frame_rate"
         private const val EXTRA_BITRATE = "extra_bitrate"
+        private const val EXTRA_MODE = "extra_mode"
 
         private const val CHANNEL_ID = "screen_capture"
         private const val NOTIFICATION_ID = 41
         private const val REQUEST_STOP = 1
         private const val REQUEST_OPEN = 2
         private const val STOP_TIMEOUT_MS = 6_000L
+        private const val PREPARING_TIMEOUT_MS = 15_000L
 
-        fun start(context: Context, resultCode: Int, data: Intent, config: CaptureConfig) {
+        fun start(
+            context: Context,
+            resultCode: Int,
+            data: Intent,
+            config: CaptureConfig,
+            mode: CaptureMode = CaptureMode.RECORD,
+        ) {
             val intent = Intent(context, ScreenCaptureService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_RESULT_CODE, resultCode)
@@ -312,12 +455,19 @@ class ScreenCaptureService : Service() {
                 .putExtra(EXTRA_DENSITY, config.densityDpi)
                 .putExtra(EXTRA_FRAME_RATE, config.frameRate)
                 .putExtra(EXTRA_BITRATE, config.bitrate)
+                .putExtra(EXTRA_MODE, mode.name)
 
             try {
                 ContextCompat.startForegroundService(context, intent)
             } catch (e: Exception) {
                 Log.w(TAG, "Could not start the capture service", e)
-                CaptureStore.update(CaptureState.Failed("Screen capture could not be started."))
+                if (mode == CaptureMode.STREAM) {
+                    StreamingStore.update(
+                        StreamingState.Failed("Screen capture could not be started."),
+                    )
+                } else {
+                    CaptureStore.update(CaptureState.Failed("Screen capture could not be started."))
+                }
             }
         }
 

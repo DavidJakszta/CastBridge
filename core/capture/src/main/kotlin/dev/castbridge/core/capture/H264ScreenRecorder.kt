@@ -8,36 +8,51 @@ import android.media.projection.MediaProjection
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import dev.castbridge.core.streaming.AnnexB
+import dev.castbridge.core.streaming.EncodedAudioSample
+import dev.castbridge.core.streaming.EncodedVideoSample
+import dev.castbridge.core.streaming.MediaSampleSink
+import dev.castbridge.core.streaming.VideoStreamFormat
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 
-internal sealed interface RecordingOutcome {
-    data class Success(val result: RecordingResult) : RecordingOutcome
+internal sealed interface CaptureOutcome {
+    data class Success(
+        val stats: CaptureStats,
+        val recording: RecordingResult?,
+    ) : CaptureOutcome
 
-    data class Failure(val message: String, val cause: Throwable?) : RecordingOutcome
+    data class Failure(val message: String, val cause: Throwable?) : CaptureOutcome
 }
 
 /**
- * Surface-backed H.264 encoder that mirrors the MediaProjection output into an MP4.
+ * Surface-backed H.264 encoder that can write an MP4, feed a live stream, or do both.
  *
  * The virtual display renders directly into the encoder's input surface, so frames never touch the
- * CPU or a bitmap. The same encoder surface will later feed the streaming transport, which is why
- * this milestone records locally first: it proves the capture and encode path end to end.
+ * CPU or a bitmap. Output buffers are normalised to Annex-B and handed to the streaming sink on the
+ * encoder thread; the HLS muxer and HTTP server never block the display pipeline for long.
  */
 internal class H264ScreenRecorder(
     private val projection: MediaProjection,
     private val config: CaptureConfig,
-    private val outputFile: File,
+    private val outputFile: File?,
+    private val streamSink: MediaSampleSink?,
     private val onStats: (CaptureStats) -> Unit,
 ) {
     private val stopRequested = AtomicBoolean(false)
     private val startedAtElapsed = SystemClock.elapsedRealtime()
-    private val finished = CompletableDeferred<RecordingOutcome>()
+    private val finished = CompletableDeferred<CaptureOutcome>()
     private var thread: Thread? = null
 
-    /** Completes when the encoder has flushed its last frame and the MP4 is closed. */
-    val outcome: CompletableDeferred<RecordingOutcome> get() = finished
+    /** Silent AAC frames for the Cast receiver, encoded once and then looped. */
+    private var audioTrack: SilentAacTrack? = null
+    private var audioOriginUs: Long? = null
+    private var audioFrameIndex = 0L
+
+    /** Completes when the encoder has flushed its last frame and all outputs are closed. */
+    val outcome: CompletableDeferred<CaptureOutcome> get() = finished
 
     fun start() {
         check(thread == null) { "Recorder already started." }
@@ -47,7 +62,7 @@ internal class H264ScreenRecorder(
         }
     }
 
-    /** Asks the encoder to emit its final frames and close the file. */
+    /** Asks the encoder to emit its final frames and close the outputs. */
     fun requestStop() {
         stopRequested.set(true)
     }
@@ -62,30 +77,28 @@ internal class H264ScreenRecorder(
         var frames = 0L
         var bytes = 0L
         var failure: Throwable? = null
+        var streamEnded = false
+
+        val sessionLimitMs = if (outputFile != null) RECORDING_LIMIT_MS else STREAMING_LIMIT_MS
 
         try {
-            val activeMuxer = MediaMuxer(
-                outputFile.absolutePath,
-                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
-            )
+            val activeMuxer = outputFile?.let { file ->
+                MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            }
             muxer = activeMuxer
 
-            val format = MediaFormat.createVideoFormat(MIME_TYPE, config.width, config.height).apply {
-                setInteger(
-                    MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
-                )
-                setInteger(MediaFormat.KEY_BIT_RATE, config.bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.keyFrameIntervalSeconds)
-            }
-
-            val activeCodec = MediaCodec.createEncoderByType(MIME_TYPE)
+            val activeCodec = createEncoder()
             codec = activeCodec
-            activeCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = activeCodec.createInputSurface()
             inputSurface = surface
             activeCodec.start()
+
+            if (streamSink != null) {
+                audioTrack = SilentAacTrack.create()
+                if (audioTrack == null) {
+                    Log.w(TAG, "No AAC encoder available; the stream will be video-only")
+                }
+            }
 
             virtualDisplay = projection.createVirtualDisplay(
                 DISPLAY_NAME,
@@ -110,29 +123,74 @@ internal class H264ScreenRecorder(
 
                 when (val index = activeCodec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)) {
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        if (!muxerStarted) {
-                            trackIndex = activeMuxer.addTrack(activeCodec.outputFormat)
+                        val outputFormat = activeCodec.outputFormat
+                        val width = outputFormat.intOr(MediaFormat.KEY_WIDTH, config.width)
+                        val height = outputFormat.intOr(MediaFormat.KEY_HEIGHT, config.height)
+                        val sps = runCatching {
+                            outputFormat.getByteBuffer("csd-0")?.copyBytes()
+                        }.getOrNull()
+                        val pps = runCatching {
+                            outputFormat.getByteBuffer("csd-1")?.copyBytes()
+                        }.getOrNull()
+
+                        if (activeMuxer != null && !muxerStarted) {
+                            trackIndex = activeMuxer.addTrack(outputFormat)
                             activeMuxer.start()
                             muxerStarted = true
                         }
+
+                        streamSink?.onFormat(
+                            VideoStreamFormat(
+                                width = width,
+                                height = height,
+                                sps = sps,
+                                pps = pps,
+                            ),
+                        )
                     }
 
                     MediaCodec.INFO_TRY_AGAIN_LATER, MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
 
                     else -> if (index >= 0) {
                         val buffer = activeCodec.getOutputBuffer(index)
-                        if (buffer != null &&
-                            bufferInfo.size > 0 &&
-                            (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
-                        ) {
+                        if (buffer != null && bufferInfo.size > 0) {
                             buffer.position(bufferInfo.offset)
                             buffer.limit(bufferInfo.offset + bufferInfo.size)
-                            if (muxerStarted) {
-                                activeMuxer.writeSampleData(trackIndex, buffer, bufferInfo)
+
+                            val isCodecConfig =
+                                (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+
+                            if (isCodecConfig) {
+                                val configData = buffer.copyBytes()
+                                streamSink?.onCodecConfig(AnnexB.normalize(configData))
+                            } else {
                                 frames++
                                 bytes += bufferInfo.size
+
+                                if (muxerStarted) {
+                                    activeMuxer?.writeSampleData(trackIndex, buffer, bufferInfo)
+                                }
+
+                                val sink = streamSink
+                                if (sink != null) {
+                                    buffer.position(bufferInfo.offset)
+                                    buffer.limit(bufferInfo.offset + bufferInfo.size)
+                                    val presentationTimeUs = bufferInfo.presentationTimeUs
+                                    sink.onSample(
+                                        EncodedVideoSample(
+                                            data = AnnexB.normalize(buffer.copyBytes()),
+                                            presentationTimeUs = presentationTimeUs,
+                                            isKeyFrame = (
+                                                bufferInfo.flags and
+                                                    MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                                ) != 0,
+                                        ),
+                                    )
+                                    emitSilence(sink, presentationTimeUs)
+                                }
                             }
                         }
+
                         activeCodec.releaseOutputBuffer(index, false)
                         if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
                     }
@@ -154,8 +212,8 @@ internal class H264ScreenRecorder(
                     )
                 }
 
-                if (now - startedAtElapsed >= MAX_SESSION_MS) {
-                    Log.w(TAG, "Capture reached the ${MAX_SESSION_MS / 60_000} minute limit")
+                if (now - startedAtElapsed >= sessionLimitMs) {
+                    Log.w(TAG, "Capture reached the ${sessionLimitMs / 60_000} minute limit")
                     stopRequested.set(true)
                 }
             }
@@ -163,6 +221,12 @@ internal class H264ScreenRecorder(
             failure = t
             Log.w(TAG, "Encoder pipeline failed", t)
         } finally {
+            if (!streamEnded) {
+                streamEnded = true
+                runCatching { streamSink?.onEnd() }
+                    .onFailure { Log.w(TAG, "Streaming sink failed to finish", it) }
+            }
+
             runCatching { virtualDisplay?.release() }
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
@@ -171,31 +235,132 @@ internal class H264ScreenRecorder(
             runCatching { muxer?.release() }
 
             val durationMillis = SystemClock.elapsedRealtime() - startedAtElapsed
-            val valid = failure == null && muxerStarted && frames > 0 && outputFile.length() > 0
+            val recordingValid = outputFile == null || (
+                muxerStarted &&
+                    frames > 0 &&
+                    outputFile.length() > 0
+                )
+            val valid = failure == null && frames > 0 && recordingValid
+
             if (!valid) {
-                runCatching { outputFile.delete() }
+                runCatching { outputFile?.delete() }
             }
 
             val outcome = if (valid) {
-                RecordingOutcome.Success(
+                val stats = CaptureStats(
+                    elapsedMillis = durationMillis,
+                    frames = frames,
+                    bytes = bytes,
+                    width = config.width,
+                    height = config.height,
+                    bitrate = config.bitrate,
+                    frameRate = config.frameRate,
+                )
+                val recording = outputFile?.let { file ->
                     RecordingResult(
-                        filePath = outputFile.absolutePath,
+                        filePath = file.absolutePath,
                         durationMillis = durationMillis,
                         width = config.width,
                         height = config.height,
-                        sizeBytes = outputFile.length(),
+                        sizeBytes = file.length(),
                         frameCount = frames,
-                    ),
-                )
+                    )
+                }
+                CaptureOutcome.Success(stats = stats, recording = recording)
             } else {
-                RecordingOutcome.Failure(
+                CaptureOutcome.Failure(
                     message = failure?.message
-                        ?: "The encoder did not produce any video. Try recording again.",
+                        ?: "The encoder did not produce any video. Try again.",
                     cause = failure,
                 )
             }
             finished.complete(outcome)
         }
+    }
+
+    /**
+     * Creates the H.264 encoder, asking for High profile at the level the stream actually needs.
+     *
+     * Some encoders reject explicit profile or level keys, so the second attempt falls back to the
+     * device defaults instead of failing the capture.
+     */
+    private fun createEncoder(): MediaCodec {
+        val preferred = MediaCodec.createEncoderByType(MIME_TYPE)
+        try {
+            preferred.configure(
+                createVideoFormat(withLevelOverrides = true),
+                null,
+                null,
+                MediaCodec.CONFIGURE_FLAG_ENCODE,
+            )
+            return preferred
+        } catch (error: Exception) {
+            Log.w(TAG, "Encoder rejected the H.264 profile/level overrides; using defaults", error)
+            runCatching { preferred.release() }
+        }
+
+        return MediaCodec.createEncoderByType(MIME_TYPE).also {
+            it.configure(
+                createVideoFormat(withLevelOverrides = false),
+                null,
+                null,
+                MediaCodec.CONFIGURE_FLAG_ENCODE,
+            )
+        }
+    }
+
+    private fun createVideoFormat(withLevelOverrides: Boolean): MediaFormat =
+        MediaFormat.createVideoFormat(MIME_TYPE, config.width, config.height).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, config.bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.keyFrameIntervalSeconds)
+            if (withLevelOverrides) {
+                setInteger(
+                    MediaFormat.KEY_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+                )
+                setInteger(
+                    MediaFormat.KEY_LEVEL,
+                    H264Levels.forFrame(config.width, config.height, config.frameRate),
+                )
+            }
+        }
+
+    /**
+     * Emits the silent AAC frames that cover the video timeline up to [videoPtsUs].
+     *
+     * A static screen stops producing video for a while, so after a long gap the audio grid jumps
+     * forward instead of emitting minutes of catch-up frames.
+     */
+    private fun emitSilence(sink: MediaSampleSink, videoPtsUs: Long) {
+        val track = audioTrack ?: return
+        val origin = audioOriginUs ?: videoPtsUs.also { audioOriginUs = it }
+
+        var ptsUs = origin + track.frameTimeUs(audioFrameIndex)
+        if (videoPtsUs - ptsUs > MAX_AUDIO_CATCH_UP_US) {
+            audioFrameIndex += (videoPtsUs - ptsUs) / track.frameDurationUs
+            ptsUs = origin + track.frameTimeUs(audioFrameIndex)
+        }
+
+        while (ptsUs <= videoPtsUs) {
+            sink.onAudioSample(EncodedAudioSample(track.frame(audioFrameIndex), ptsUs))
+            audioFrameIndex++
+            ptsUs = origin + track.frameTimeUs(audioFrameIndex)
+        }
+    }
+
+    private fun MediaFormat.intOr(key: String, fallback: Int): Int =
+        runCatching { getInteger(key) }.getOrDefault(fallback)
+
+    private fun ByteBuffer.copyBytes(): ByteArray {
+        val duplicate = duplicate()
+        val data = ByteArray(duplicate.remaining())
+        duplicate.get(data)
+        return data
     }
 
     private companion object {
@@ -204,6 +369,10 @@ internal class H264ScreenRecorder(
         const val DISPLAY_NAME = "CastBridge"
         const val DEQUEUE_TIMEOUT_US = 10_000L
         const val STATS_INTERVAL_MS = 500L
-        const val MAX_SESSION_MS = 30 * 60 * 1000L
+        const val RECORDING_LIMIT_MS = 30 * 60 * 1000L
+        const val STREAMING_LIMIT_MS = 2 * 60 * 60 * 1000L
+
+        /** After a static-screen gap, resync the silent audio instead of emitting stale frames. */
+        const val MAX_AUDIO_CATCH_UP_US = 2_000_000L
     }
 }

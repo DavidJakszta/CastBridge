@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<component name="MainScene" extends="Scene">
+    <interface>
+        <field id="launchArgs" type="assocarray" />
+    </interface>
+
+    <children>
+        <Video
+            id="video"
+            width="1280"
+            height="720"
+            enableUI="false"
+            visible="false" />
+
+        <Label
+            id="message"
+            width="1100"
+            height="120"
+            horizAlign="center"
+            vertAlign="center"
+            font="font:LargeBoldSystemFont"
+            color="#FFFFFFFF" />
+
+        <Label
+            id="hint"
+            width="1100"
+            height="100"
+            horizAlign="center"
+            vertAlign="center"
+            font="font:MediumSystemFont"
+            color="#99FFFFFF" />
+
+        <Label
+            id="code"
+            width="1280"
+            height="40"
+            horizAlign="right"
+            vertAlign="center"
+            font="font:SmallSystemFont"
+            color="#66FFFFFF"
+            text=""
+            visible="false" />
+    </children>
+
+    <script type="text/brightscript" uri="pkg:/components/MainScene.brs" />
+</component>

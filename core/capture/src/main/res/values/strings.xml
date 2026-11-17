@@ -1,13 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="capture_notification_channel">Screen capture</string>
-    <string name="capture_notification_channel_description">Shown while CastBridge records your screen.</string>
+    <string name="capture_notification_channel_description">Shown while CastBridge records or streams your screen.</string>
     <string name="capture_notification_title">Recording your screen</string>
     <string name="capture_notification_text">CastBridge is capturing and encoding your screen.</string>
+    <string name="capture_notification_title_stream">Streaming your screen</string>
+    <string name="capture_notification_text_stream">CastBridge is sending your screen to your TV.</string>
     <string name="capture_notification_stop">Stop</string>
+    <string name="capture_notification_stop_stream">Stop stream</string>
 
     <string name="capture_error_permission">Screen capture permission was not granted.</string>
     <string name="capture_error_projection">Could not start screen capture.</string>
     <string name="capture_error_foreground">Android blocked the capture service from starting.</string>
     <string name="capture_error_timeout">The encoder did not stop in time.</string>
+    <string name="capture_error_stream">Could not start the live stream. Check that the phone is on Wi-Fi and try again.</string>
+<string name="capture_error_no_frames">No video arrived from the screen. In the capture dialog choose &quot;Entire screen&quot; instead of &quot;Share one app&quot;, then start the stream again.</string>
 </resources>

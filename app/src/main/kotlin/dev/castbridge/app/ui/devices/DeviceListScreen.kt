@@ -2,6 +2,8 @@ package dev.castbridge.app.ui.devices
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -63,6 +65,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -79,6 +82,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -95,14 +99,18 @@ import dev.castbridge.app.ui.components.ProtocolBadge
 import dev.castbridge.app.ui.theme.CastBridgeTheme
 import dev.castbridge.core.capture.CaptureConfigFactory
 import dev.castbridge.core.capture.CaptureFormat
+import dev.castbridge.core.capture.CaptureMode
 import dev.castbridge.core.capture.CaptureState
 import dev.castbridge.core.capture.ScreenCaptureRequest
+import dev.castbridge.core.casting.CastingState
 import dev.castbridge.core.model.CastDevice
 import dev.castbridge.core.model.CastProtocol
 import dev.castbridge.core.model.ChromecastDevice
 import dev.castbridge.core.model.DiscoveryIssue
 import dev.castbridge.core.model.RokuDevice
+import dev.castbridge.core.streaming.StreamingState
 import java.io.File
+import kotlinx.coroutines.launch
 
 @Composable
 fun DeviceListRoute() {
@@ -143,13 +151,18 @@ fun DeviceListRoute() {
     val captureConfig = remember(context) {
         CaptureConfigFactory.forDisplay(context.resources.displayMetrics)
     }
+    val clipboard = remember(context) {
+        context.getSystemService(ClipboardManager::class.java)
+    }
+    val scope = rememberCoroutineScope()
+    var pendingMode by remember { mutableStateOf(CaptureMode.RECORD) }
 
     val captureLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         val data = result.data
         if (result.resultCode == Activity.RESULT_OK && data != null) {
-            viewModel.startCapture(result.resultCode, data, captureConfig)
+            viewModel.startCapture(result.resultCode, data, captureConfig, pendingMode)
         }
     }
 
@@ -160,7 +173,8 @@ fun DeviceListRoute() {
         captureLauncher.launch(ScreenCaptureRequest.intent(context))
     }
 
-    val onStartCapture: () -> Unit = {
+    val requestCapture: (CaptureMode) -> Unit = { mode ->
+        pendingMode = mode
         val needsNotificationPermission =
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 ContextCompat.checkSelfPermission(
@@ -175,6 +189,13 @@ fun DeviceListRoute() {
         }
     }
 
+    val onCopyStreamUrl: (String) -> Unit = { url ->
+        clipboard?.setPrimaryClip(ClipData.newPlainText("CastBridge stream", url))
+        scope.launch {
+            snackbarHostState.showSnackbar(context.getString(R.string.stream_copied))
+        }
+    }
+
     DeviceListScreen(
         state = state,
         snackbarHostState = snackbarHostState,
@@ -182,9 +203,16 @@ fun DeviceListRoute() {
         onFilterSelected = viewModel::selectFilter,
         onShowDetails = { device -> detailsDeviceId = device.id },
         onTestConnection = viewModel::testConnection,
-        onStartCapture = onStartCapture,
+        onStartCapture = { requestCapture(CaptureMode.RECORD) },
         onStopCapture = viewModel::stopCapture,
         onDismissCapture = viewModel::dismissCaptureResult,
+        onStartStreaming = { requestCapture(CaptureMode.STREAM) },
+        onStopStreaming = viewModel::stopCapture,
+        onDismissStreaming = viewModel::dismissStreamingResult,
+        onCopyStreamUrl = onCopyStreamUrl,
+        onCast = viewModel::castToSelected,
+        onStopCast = viewModel::stopCasting,
+        onDismissCast = viewModel::dismissCastingResult,
     )
 
     detailsDevice?.let { device ->
@@ -209,6 +237,13 @@ internal fun DeviceListScreen(
     onStartCapture: () -> Unit,
     onStopCapture: () -> Unit,
     onDismissCapture: () -> Unit,
+    onStartStreaming: () -> Unit,
+    onStopStreaming: () -> Unit,
+    onDismissStreaming: () -> Unit,
+    onCopyStreamUrl: (String) -> Unit,
+    onCast: () -> Unit,
+    onStopCast: () -> Unit,
+    onDismissCast: () -> Unit,
 ) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -248,9 +283,26 @@ internal fun DeviceListScreen(
             item(key = "capture") {
                 CaptureCard(
                     state = state.capture,
+                    canStart = !state.streaming.isActive(),
                     onStart = onStartCapture,
                     onStop = onStopCapture,
                     onDismiss = onDismissCapture,
+                )
+            }
+
+            item(key = "stream") {
+                StreamCard(
+                    state = state.streaming,
+                    canStart = !state.capture.isActive(),
+                    selectedDevice = state.selectedDevice,
+                    casting = state.casting,
+                    onStart = onStartStreaming,
+                    onStop = onStopStreaming,
+                    onDismiss = onDismissStreaming,
+                    onCopyUrl = onCopyStreamUrl,
+                    onCast = onCast,
+                    onStopCast = onStopCast,
+                    onDismissCast = onDismissCast,
                 )
             }
 
@@ -444,6 +496,7 @@ private fun FilterRow(
 @Composable
 private fun CaptureCard(
     state: CaptureState,
+    canStart: Boolean,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onDismiss: () -> Unit,
@@ -501,6 +554,7 @@ private fun CaptureCard(
                     Spacer(Modifier.height(12.dp))
                     Button(
                         onClick = onStart,
+                        enabled = canStart,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(48.dp),
@@ -606,6 +660,7 @@ private fun CaptureCard(
                         }
                         Button(
                             onClick = onStart,
+                            enabled = canStart,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(48.dp),
@@ -624,11 +679,456 @@ private fun CaptureCard(
                     Spacer(Modifier.height(12.dp))
                     Button(
                         onClick = onStart,
+                        enabled = canStart,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(48.dp),
                     ) {
                         Text(stringResource(R.string.capture_retry))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StreamCard(
+    state: StreamingState,
+    canStart: Boolean,
+    selectedDevice: CastDevice?,
+    casting: CastingState,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onDismiss: () -> Unit,
+    onCopyUrl: (String) -> Unit,
+    onCast: () -> Unit,
+    onStopCast: () -> Unit,
+    onDismissCast: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
+        tonalElevation = 1.dp,
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_cast),
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.stream_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = stringResource(R.string.stream_subtitle),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (state is StreamingState.Live) {
+                    PulsePill(
+                        text = stringResource(R.string.stream_live),
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            when (state) {
+                StreamingState.Idle -> {
+                    Text(
+                        text = stringResource(R.string.stream_idle_body),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = stringResource(R.string.stream_entire_screen_hint),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = onStart,
+                        enabled = canStart,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_cast),
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.stream_start))
+                    }
+                }
+
+                StreamingState.Preparing ->
+                    CaptureProgress(stringResource(R.string.stream_preparing))
+
+                StreamingState.Stopping ->
+                    CaptureProgress(stringResource(R.string.stream_stopping))
+
+                is StreamingState.Live -> {
+                    StreamUrl(url = state.url, onCopy = { onCopyUrl(state.url) })
+                    Spacer(Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    ) {
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_elapsed),
+                            value = CaptureFormat.elapsed(state.stats.elapsedMillis),
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_resolution),
+                            value = CaptureFormat.resolution(state.stats.width, state.stats.height),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    ) {
+                        CaptureStat(
+                            label = stringResource(R.string.stream_stat_segments),
+                            value = state.stats.segments.toString(),
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureStat(
+                            label = stringResource(R.string.capture_stat_size),
+                            value = CaptureFormat.bytes(state.stats.bytes),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    CastControls(
+                        selectedDevice = selectedDevice,
+                        casting = casting,
+                        onCast = onCast,
+                        onStopCast = onStopCast,
+                        onDismissCast = onDismissCast,
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    OutlinedButton(
+                        onClick = onStop,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_stop),
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.stream_stop))
+                    }
+                }
+
+                is StreamingState.Stopped -> {
+                    Text(
+                        text = stringResource(R.string.stream_stopped),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    state.summary?.let { summary ->
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(20.dp),
+                        ) {
+                            CaptureStat(
+                                label = stringResource(R.string.capture_stat_duration),
+                                value = CaptureFormat.elapsed(summary.durationMillis),
+                                modifier = Modifier.weight(1f),
+                            )
+                            CaptureStat(
+                                label = stringResource(R.string.stream_stat_segments),
+                                value = summary.segments.toString(),
+                                modifier = Modifier.weight(1f),
+                            )
+                            CaptureStat(
+                                label = stringResource(R.string.capture_stat_size),
+                                value = CaptureFormat.bytes(summary.bytes),
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                        ) {
+                            Text(stringResource(R.string.stream_dismiss))
+                        }
+                        Button(
+                            onClick = onStart,
+                            enabled = canStart,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                        ) {
+                            Text(stringResource(R.string.stream_start_again))
+                        }
+                    }
+                }
+
+                is StreamingState.Failed -> {
+                    Text(
+                        text = state.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = onStart,
+                        enabled = canStart,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                    ) {
+                        Text(stringResource(R.string.stream_retry))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StreamUrl(url: String, onCopy: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = stringResource(R.string.stream_url_label).uppercase(),
+                    style = MaterialTheme.typography.labelSmall,
+                    letterSpacing = 0.8.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onCopy) {
+                    Text(stringResource(R.string.stream_copy_url))
+                }
+            }
+            Text(
+                text = url,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stringResource(R.string.stream_url_hint),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CastControls(
+    selectedDevice: CastDevice?,
+    casting: CastingState,
+    onCast: () -> Unit,
+    onStopCast: () -> Unit,
+    onDismissCast: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            when (casting) {
+                CastingState.Idle -> {
+                    if (selectedDevice == null) {
+                        Text(
+                            text = stringResource(R.string.cast_select_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Button(
+                            onClick = onCast,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp),
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_cast),
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(stringResource(R.string.cast_play, selectedDevice.name))
+                        }
+                    }
+                }
+
+                is CastingState.Connecting -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            text = stringResource(R.string.cast_connecting, casting.deviceName),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                is CastingState.Playing -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_check),
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                text = stringResource(R.string.cast_playing, casting.deviceName),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = stringResource(
+                                    R.string.cast_pairing_code,
+                                    casting.pairingCode,
+                                ),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = stringResource(R.string.cast_pairing_hint),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = onStopCast,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Text(stringResource(R.string.cast_stop))
+                    }
+                }
+
+                is CastingState.Failed -> {
+                    Text(
+                        text = casting.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = onDismissCast,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp),
+                        ) {
+                            Text(stringResource(R.string.cast_dismiss))
+                        }
+                        Button(
+                            onClick = onCast,
+                            enabled = selectedDevice != null,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp),
+                        ) {
+                            Text(stringResource(R.string.cast_retry))
+                        }
+                    }
+                }
+
+                is CastingState.Stopped -> {
+                    Text(
+                        text = stringResource(R.string.cast_stopped, casting.deviceName),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = onDismissCast,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp),
+                        ) {
+                            Text(stringResource(R.string.cast_dismiss))
+                        }
+                        Button(
+                            onClick = onCast,
+                            enabled = selectedDevice != null,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp),
+                        ) {
+                            Text(stringResource(R.string.cast_retry))
+                        }
                     }
                 }
             }
@@ -674,30 +1174,48 @@ private fun CaptureStat(label: String, value: String, modifier: Modifier = Modif
 
 @Composable
 private fun RecordingPill() {
-    val transition = rememberInfiniteTransition(label = "recordingPill")
+    PulsePill(
+        text = stringResource(R.string.capture_live),
+        color = MaterialTheme.colorScheme.error,
+    )
+}
+
+@Composable
+private fun PulsePill(text: String, color: Color) {
+    val transition = rememberInfiniteTransition(label = "statusPill")
     val alpha by transition.animateFloat(
         initialValue = 0.35f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
-        label = "recordingPulse",
+        label = "statusPulse",
     )
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
             Modifier
                 .size(8.dp)
-                .background(MaterialTheme.colorScheme.error.copy(alpha = alpha), CircleShape),
+                .background(color.copy(alpha = alpha), CircleShape),
         )
         Spacer(Modifier.width(6.dp))
         Text(
-            text = stringResource(R.string.capture_live),
+            text = text,
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
             letterSpacing = 1.sp,
-            color = MaterialTheme.colorScheme.error,
+            color = color,
         )
     }
 }
+
+private fun CaptureState.isActive(): Boolean =
+    this is CaptureState.Preparing ||
+        this is CaptureState.Running ||
+        this is CaptureState.Finalizing
+
+private fun StreamingState.isActive(): Boolean =
+    this is StreamingState.Preparing ||
+        this is StreamingState.Live ||
+        this is StreamingState.Stopping
 
 @Composable
 private fun DeviceCard(
@@ -1117,6 +1635,13 @@ private fun DeviceListPopulatedPreview() {
             onStartCapture = {},
             onStopCapture = {},
             onDismissCapture = {},
+            onStartStreaming = {},
+            onStopStreaming = {},
+            onDismissStreaming = {},
+            onCopyStreamUrl = {},
+            onCast = {},
+            onStopCast = {},
+            onDismissCast = {},
         )
     }
 }
@@ -1135,6 +1660,13 @@ private fun DeviceListEmptyPreview() {
             onStartCapture = {},
             onStopCapture = {},
             onDismissCapture = {},
+            onStartStreaming = {},
+            onStopStreaming = {},
+            onDismissStreaming = {},
+            onCopyStreamUrl = {},
+            onCast = {},
+            onStopCast = {},
+            onDismissCast = {},
         )
     }
 }

@@ -12,8 +12,8 @@ android {
         applicationId = "dev.castbridge.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 4
+        versionName = "0.4.0"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -57,6 +57,8 @@ dependencies {
     implementation(project(":core:model"))
     implementation(project(":core:discovery"))
     implementation(project(":core:capture"))
+    implementation(project(":core:streaming"))
+    implementation(project(":core:casting"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)

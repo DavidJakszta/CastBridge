@@ -9,8 +9,12 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.castbridge.app.di.AppContainer
 import dev.castbridge.core.capture.CaptureConfig
 import dev.castbridge.core.capture.CaptureController
+import dev.castbridge.core.capture.CaptureMode
 import dev.castbridge.core.capture.CaptureState
+import dev.castbridge.core.casting.CastingController
+import dev.castbridge.core.casting.CastingState
 import dev.castbridge.core.discovery.repository.DeviceDiscoveryRepository
+import dev.castbridge.core.streaming.StreamingState
 import dev.castbridge.core.model.CastDevice
 import dev.castbridge.core.model.CastProtocol
 import dev.castbridge.core.model.DeviceProbe
@@ -49,6 +53,8 @@ data class DeviceListUiState(
     val completedCycles: Int = 0,
     val probe: ProbeUiState = ProbeUiState(),
     val capture: CaptureState = CaptureState.Idle,
+    val streaming: StreamingState = StreamingState.Idle,
+    val casting: CastingState = CastingState.Idle,
 )
 
 sealed interface DeviceListEvent {
@@ -61,6 +67,7 @@ class DeviceListViewModel(
     private val repository: DeviceDiscoveryRepository,
     private val deviceProbe: DeviceProbe,
     private val captureController: CaptureController,
+    private val castingController: CastingController,
 ) : ViewModel() {
 
     private val selectedDeviceId = MutableStateFlow<String?>(null)
@@ -71,13 +78,36 @@ class DeviceListViewModel(
     private val _events = MutableSharedFlow<DeviceListEvent>(extraBufferCapacity = 2)
     val events = _events.asSharedFlow()
 
+    private data class SessionUi(
+        val capture: CaptureState,
+        val streaming: StreamingState,
+        val casting: CastingState,
+    )
+
+    private val sessionUi = combine(
+        captureController.state,
+        captureController.streamingState,
+        castingController.state,
+    ) { capture, streaming, casting -> SessionUi(capture, streaming, casting) }
+
+    init {
+        // A cast session cannot outlive the stream it plays.
+        viewModelScope.launch {
+            captureController.streamingState.collect { streaming ->
+                if (streaming is StreamingState.Stopped || streaming is StreamingState.Failed) {
+                    castingController.stopIfActive()
+                }
+            }
+        }
+    }
+
     val uiState: StateFlow<DeviceListUiState> = combine(
         repository.state,
         selectedDeviceId,
         filter,
         probeState,
-        captureController.state,
-    ) { discovery, selectedId, activeFilter, probe, capture ->
+        sessionUi,
+    ) { discovery, selectedId, activeFilter, probe, session ->
         val selected = discovery.devices.firstOrNull { it.id == selectedId }
         val visible = when (activeFilter) {
             DeviceFilter.ALL -> discovery.devices
@@ -99,7 +129,9 @@ class DeviceListViewModel(
             issues = discovery.issues,
             completedCycles = discovery.completedCycles,
             probe = probe,
-            capture = capture,
+            capture = session.capture,
+            streaming = session.streaming,
+            casting = session.casting,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -158,8 +190,13 @@ class DeviceListViewModel(
         }
     }
 
-    fun startCapture(resultCode: Int, data: Intent, config: CaptureConfig) {
-        captureController.start(resultCode, data, config)
+    fun startCapture(
+        resultCode: Int,
+        data: Intent,
+        config: CaptureConfig,
+        mode: CaptureMode = CaptureMode.RECORD,
+    ) {
+        captureController.start(resultCode, data, config, mode)
     }
 
     fun stopCapture() {
@@ -170,9 +207,28 @@ class DeviceListViewModel(
         captureController.reset()
     }
 
+    fun dismissStreamingResult() {
+        captureController.resetStreaming()
+    }
+
+    fun castToSelected() {
+        val device = uiState.value.selectedDevice ?: return
+        val live = uiState.value.streaming as? StreamingState.Live ?: return
+        castingController.cast(device, live.url, live.stats.width, live.stats.height)
+    }
+
+    fun stopCasting() {
+        castingController.stop()
+    }
+
+    fun dismissCastingResult() {
+        castingController.reset()
+    }
+
     override fun onCleared() {
         probeJob?.cancel()
         repository.stopScanning()
+        castingController.stopIfActive()
         super.onCleared()
     }
 
@@ -183,6 +239,7 @@ class DeviceListViewModel(
                     repository = container.deviceRepository,
                     deviceProbe = container.deviceProbe,
                     captureController = container.captureController,
+                    castingController = container.castingController,
                 )
             }
         }
