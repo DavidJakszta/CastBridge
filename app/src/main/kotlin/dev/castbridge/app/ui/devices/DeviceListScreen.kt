@@ -103,6 +103,7 @@ import dev.castbridge.core.capture.CaptureMode
 import dev.castbridge.core.capture.CaptureState
 import dev.castbridge.core.capture.ScreenCaptureRequest
 import dev.castbridge.core.casting.CastingState
+import dev.castbridge.core.casting.ScreenFraming
 import dev.castbridge.core.model.CastDevice
 import dev.castbridge.core.model.CastProtocol
 import dev.castbridge.core.model.ChromecastDevice
@@ -202,16 +203,19 @@ fun DeviceListRoute() {
         onDeviceClick = viewModel::toggleSelection,
         onFilterSelected = viewModel::selectFilter,
         onShowDetails = { device -> detailsDeviceId = device.id },
-        onTestConnection = viewModel::testConnection,
         onStartCapture = { requestCapture(CaptureMode.RECORD) },
         onStopCapture = viewModel::stopCapture,
         onDismissCapture = viewModel::dismissCaptureResult,
         onStartStreaming = { requestCapture(CaptureMode.STREAM) },
-        onStopStreaming = viewModel::stopCapture,
         onDismissStreaming = viewModel::dismissStreamingResult,
         onCopyStreamUrl = onCopyStreamUrl,
-        onCast = viewModel::castToSelected,
-        onStopCast = viewModel::stopCasting,
+        onPlay = {
+            // Consent is only needed when there is no stream yet; playOnSelected() knows.
+            if (viewModel.playOnSelected()) requestCapture(CaptureMode.STREAM)
+        },
+        onStopMirroring = viewModel::stopMirroring,
+        onSwitchDevice = viewModel::castToSelected,
+        onFramingSelected = viewModel::setFraming,
         onDismissCast = viewModel::dismissCastingResult,
     )
 
@@ -233,16 +237,16 @@ internal fun DeviceListScreen(
     onDeviceClick: (String) -> Unit,
     onFilterSelected: (DeviceFilter) -> Unit,
     onShowDetails: (CastDevice) -> Unit,
-    onTestConnection: (String) -> Unit,
     onStartCapture: () -> Unit,
     onStopCapture: () -> Unit,
     onDismissCapture: () -> Unit,
     onStartStreaming: () -> Unit,
-    onStopStreaming: () -> Unit,
     onDismissStreaming: () -> Unit,
     onCopyStreamUrl: (String) -> Unit,
-    onCast: () -> Unit,
-    onStopCast: () -> Unit,
+    onPlay: () -> Unit,
+    onStopMirroring: () -> Unit,
+    onSwitchDevice: () -> Unit,
+    onFramingSelected: (ScreenFraming) -> Unit,
     onDismissCast: () -> Unit,
 ) {
     Scaffold(
@@ -256,11 +260,18 @@ internal fun DeviceListScreen(
                 exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
             ) {
                 state.selectedDevice?.let { device ->
+                    val playingHere =
+                        (state.casting as? CastingState.Playing)?.deviceId == device.id
+                    val connectingHere =
+                        (state.casting as? CastingState.Connecting)?.deviceId == device.id
                     SelectedDeviceBar(
                         device = device,
-                        isChecking = state.probe.isChecking && state.probe.deviceId == device.id,
+                        isPlaying = playingHere,
+                        isBusy = playingHere || connectingHere,
+                        canPlay = !state.capture.isActive() || state.streaming is StreamingState.Live,
                         onDetails = { onShowDetails(device) },
-                        onTest = { onTestConnection(device.id) },
+                        onPlay = onPlay,
+                        onStop = onStopMirroring,
                     )
                 }
             }
@@ -296,12 +307,15 @@ internal fun DeviceListScreen(
                     canStart = !state.capture.isActive(),
                     selectedDevice = state.selectedDevice,
                     casting = state.casting,
-                    onStart = onStartStreaming,
-                    onStop = onStopStreaming,
+                    framing = state.framing,
+                    pendingCastDeviceId = state.pendingCastDeviceId,
+                    onPlay = onPlay,
+                    onStreamOnly = onStartStreaming,
+                    onStop = onStopMirroring,
                     onDismiss = onDismissStreaming,
                     onCopyUrl = onCopyStreamUrl,
-                    onCast = onCast,
-                    onStopCast = onStopCast,
+                    onSwitchDevice = onSwitchDevice,
+                    onFramingSelected = onFramingSelected,
                     onDismissCast = onDismissCast,
                 )
             }
@@ -698,12 +712,15 @@ private fun StreamCard(
     canStart: Boolean,
     selectedDevice: CastDevice?,
     casting: CastingState,
-    onStart: () -> Unit,
+    framing: ScreenFraming,
+    pendingCastDeviceId: String?,
+    onPlay: () -> Unit,
+    onStreamOnly: () -> Unit,
     onStop: () -> Unit,
     onDismiss: () -> Unit,
     onCopyUrl: (String) -> Unit,
-    onCast: () -> Unit,
-    onStopCast: () -> Unit,
+    onSwitchDevice: () -> Unit,
+    onFramingSelected: (ScreenFraming) -> Unit,
     onDismissCast: () -> Unit,
 ) {
     Surface(
@@ -759,32 +776,33 @@ private fun StreamCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(12.dp))
+                    PlayActions(
+                        selectedDevice = selectedDevice,
+                        canStart = canStart,
+                        onPlay = onPlay,
+                        onStreamOnly = onStreamOnly,
+                    )
+                    Spacer(Modifier.height(10.dp))
                     Text(
                         text = stringResource(R.string.stream_entire_screen_hint),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
-                    Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = onStart,
-                        enabled = canStart,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp),
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_cast),
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(stringResource(R.string.stream_start))
-                    }
                 }
 
-                StreamingState.Preparing ->
+                StreamingState.Preparing -> {
                     CaptureProgress(stringResource(R.string.stream_preparing))
+                    val pending = selectedDevice?.takeIf { it.id == pendingCastDeviceId }
+                    if (pending != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = stringResource(R.string.stream_pending_tv, pending.name),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
 
                 StreamingState.Stopping ->
                     CaptureProgress(stringResource(R.string.stream_stopping))
@@ -824,13 +842,23 @@ private fun StreamCard(
                         )
                     }
                     Spacer(Modifier.height(14.dp))
-                    CastControls(
+                    CastStatus(
                         selectedDevice = selectedDevice,
                         casting = casting,
-                        onCast = onCast,
-                        onStopCast = onStopCast,
+                        onPlay = onPlay,
+                        onStop = onStop,
+                        onSwitchDevice = onSwitchDevice,
                         onDismissCast = onDismissCast,
                     )
+                    if (selectedDevice?.protocol == CastProtocol.ROKU ||
+                        (casting as? CastingState.Playing)?.protocol == CastProtocol.ROKU
+                    ) {
+                        Spacer(Modifier.height(12.dp))
+                        FramingPicker(
+                            framing = framing,
+                            onFramingSelected = onFramingSelected,
+                        )
+                    }
                     Spacer(Modifier.height(14.dp))
                     OutlinedButton(
                         onClick = onStop,
@@ -847,7 +875,7 @@ private fun StreamCard(
                             modifier = Modifier.size(14.dp),
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text(stringResource(R.string.stream_stop))
+                        Text(stringResource(R.string.stream_stop_mirroring))
                     }
                 }
 
@@ -881,27 +909,17 @@ private fun StreamCard(
                         }
                     }
                     Spacer(Modifier.height(12.dp))
-                    Row(
+                    PlayActions(
+                        selectedDevice = selectedDevice,
+                        canStart = canStart,
+                        onPlay = onPlay,
+                        onStreamOnly = onStreamOnly,
+                    )
+                    TextButton(
+                        onClick = onDismiss,
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        OutlinedButton(
-                            onClick = onDismiss,
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp),
-                        ) {
-                            Text(stringResource(R.string.stream_dismiss))
-                        }
-                        Button(
-                            onClick = onStart,
-                            enabled = canStart,
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp),
-                        ) {
-                            Text(stringResource(R.string.stream_start_again))
-                        }
+                        Text(stringResource(R.string.stream_dismiss))
                     }
                 }
 
@@ -912,15 +930,12 @@ private fun StreamCard(
                         color = MaterialTheme.colorScheme.error,
                     )
                     Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = onStart,
-                        enabled = canStart,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp),
-                    ) {
-                        Text(stringResource(R.string.stream_retry))
-                    }
+                    PlayActions(
+                        selectedDevice = selectedDevice,
+                        canStart = canStart,
+                        onPlay = onPlay,
+                        onStreamOnly = onStreamOnly,
+                    )
                 }
             }
         }
@@ -963,11 +978,12 @@ private fun StreamUrl(url: String, onCopy: () -> Unit) {
 }
 
 @Composable
-private fun CastControls(
+private fun CastStatus(
     selectedDevice: CastDevice?,
     casting: CastingState,
-    onCast: () -> Unit,
-    onStopCast: () -> Unit,
+    onPlay: () -> Unit,
+    onStop: () -> Unit,
+    onSwitchDevice: () -> Unit,
     onDismissCast: () -> Unit,
 ) {
     Surface(
@@ -985,7 +1001,7 @@ private fun CastControls(
                         )
                     } else {
                         Button(
-                            onClick = onCast,
+                            onClick = onPlay,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(48.dp),
@@ -1019,12 +1035,12 @@ private fun CastControls(
                         Spacer(Modifier.height(10.dp))
                         SwitchDeviceButton(
                             deviceName = otherDevice.name,
-                            onClick = onCast,
+                            onClick = onSwitchDevice,
                         )
                     }
                     Spacer(Modifier.height(10.dp))
                     OutlinedButton(
-                        onClick = onStopCast,
+                        onClick = onStop,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(44.dp),
@@ -1081,14 +1097,14 @@ private fun CastControls(
                         Spacer(Modifier.height(10.dp))
                         SwitchDeviceButton(
                             deviceName = otherDevice.name,
-                            onClick = onCast,
+                            onClick = onSwitchDevice,
                         )
                         Spacer(Modifier.height(8.dp))
                     } else {
                         Spacer(Modifier.height(10.dp))
                     }
                     OutlinedButton(
-                        onClick = onStopCast,
+                        onClick = onStop,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(44.dp),
@@ -1120,7 +1136,7 @@ private fun CastControls(
                             Text(stringResource(R.string.cast_dismiss))
                         }
                         Button(
-                            onClick = onCast,
+                            onClick = onPlay,
                             enabled = selectedDevice != null,
                             modifier = Modifier
                                 .weight(1f)
@@ -1151,7 +1167,7 @@ private fun CastControls(
                             Text(stringResource(R.string.cast_dismiss))
                         }
                         Button(
-                            onClick = onCast,
+                            onClick = onPlay,
                             enabled = selectedDevice != null,
                             modifier = Modifier
                                 .weight(1f)
@@ -1163,6 +1179,95 @@ private fun CastControls(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PlayActions(
+    selectedDevice: CastDevice?,
+    canStart: Boolean,
+    onPlay: () -> Unit,
+    onStreamOnly: () -> Unit,
+) {
+    if (selectedDevice == null) {
+        Text(
+            text = stringResource(R.string.cast_select_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(10.dp))
+    }
+
+    Button(
+        onClick = if (selectedDevice == null) onStreamOnly else onPlay,
+        enabled = canStart,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp),
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_cast),
+            contentDescription = null,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = if (selectedDevice == null) {
+                stringResource(R.string.stream_start_without_tv)
+            } else {
+                stringResource(R.string.cast_play, selectedDevice.name)
+            },
+        )
+    }
+
+    if (selectedDevice != null) {
+        TextButton(
+            onClick = onStreamOnly,
+            enabled = canStart,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.stream_start_without_tv))
+        }
+    }
+}
+
+@Composable
+private fun FramingPicker(
+    framing: ScreenFraming,
+    onFramingSelected: (ScreenFraming) -> Unit,
+) {
+    Column {
+        Text(
+            text = stringResource(R.string.framing_label).uppercase(),
+            style = MaterialTheme.typography.labelSmall,
+            letterSpacing = 0.8.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = framing == ScreenFraming.FIT,
+                onClick = { onFramingSelected(ScreenFraming.FIT) },
+                label = { Text(stringResource(R.string.framing_fit)) },
+            )
+            FilterChip(
+                selected = framing == ScreenFraming.FILL,
+                onClick = { onFramingSelected(ScreenFraming.FILL) },
+                label = { Text(stringResource(R.string.framing_fill)) },
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = stringResource(
+                if (framing == ScreenFraming.FIT) {
+                    R.string.framing_fit_hint
+                } else {
+                    R.string.framing_fill_hint
+                },
+            ),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -1366,9 +1471,12 @@ private fun SelectionMark(selected: Boolean) {
 @Composable
 private fun SelectedDeviceBar(
     device: CastDevice,
-    isChecking: Boolean,
+    isPlaying: Boolean,
+    isBusy: Boolean,
+    canPlay: Boolean,
     onDetails: () -> Unit,
-    onTest: () -> Unit,
+    onPlay: () -> Unit,
+    onStop: () -> Unit,
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -1404,15 +1512,26 @@ private fun SelectedDeviceBar(
                 Text(stringResource(R.string.details))
             }
             Spacer(Modifier.width(4.dp))
-            Button(onClick = onTest, enabled = !isChecking) {
-                if (isChecking) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                } else {
-                    Text(stringResource(R.string.test))
+            if (isPlaying) {
+                OutlinedButton(
+                    onClick = onStop,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text(stringResource(R.string.stop))
+                }
+            } else {
+                Button(onClick = onPlay, enabled = canPlay && !isBusy) {
+                    if (isBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Text(stringResource(R.string.play))
+                    }
                 }
             }
         }
@@ -1682,16 +1801,16 @@ private fun DeviceListPopulatedPreview() {
             onDeviceClick = {},
             onFilterSelected = {},
             onShowDetails = {},
-            onTestConnection = {},
             onStartCapture = {},
             onStopCapture = {},
             onDismissCapture = {},
             onStartStreaming = {},
-            onStopStreaming = {},
             onDismissStreaming = {},
             onCopyStreamUrl = {},
-            onCast = {},
-            onStopCast = {},
+            onPlay = {},
+            onStopMirroring = {},
+            onSwitchDevice = {},
+            onFramingSelected = {},
             onDismissCast = {},
         )
     }
@@ -1707,16 +1826,16 @@ private fun DeviceListEmptyPreview() {
             onDeviceClick = {},
             onFilterSelected = {},
             onShowDetails = {},
-            onTestConnection = {},
             onStartCapture = {},
             onStopCapture = {},
             onDismissCapture = {},
             onStartStreaming = {},
-            onStopStreaming = {},
             onDismissStreaming = {},
             onCopyStreamUrl = {},
-            onCast = {},
-            onStopCast = {},
+            onPlay = {},
+            onStopMirroring = {},
+            onSwitchDevice = {},
+            onFramingSelected = {},
             onDismissCast = {},
         )
     }

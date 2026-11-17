@@ -49,15 +49,22 @@ class CastingController internal constructor(
     private var castMediaSessionId: Long? = null
     private var activeDevice: CastDevice? = null
     private var activeUrl: String? = null
+    private var activeFraming: ScreenFraming? = null
 
     /**
-     * Starts playback on [device]. Calling it again with the same device and URL is a no-op, so the
-     * UI can retry safely.
+     * Starts playback on [device]. Calling it again with the same device, URL and framing is a
+     * no-op, so the UI can retry safely.
      *
-     * [width] and [height] are the stream's pixel size. The Roku channel uses them to fill the TV
-     * screen without distortion; Chromecast ignores them.
+     * [width] and [height] are the stream's pixel size. The Roku channel uses them to fit or fill
+     * the TV screen without distortion; Chromecast letterboxes by itself and ignores them.
      */
-    fun cast(device: CastDevice, streamUrl: String, width: Int = 0, height: Int = 0) {
+    fun cast(
+        device: CastDevice,
+        streamUrl: String,
+        width: Int = 0,
+        height: Int = 0,
+        framing: ScreenFraming = ScreenFraming.FIT,
+    ) {
         val pairingCode = PairingCode.fromUrl(streamUrl).orEmpty()
         val url = if (pairingCode.isEmpty()) {
             streamUrl
@@ -69,7 +76,8 @@ class CastingController internal constructor(
         if (current is CastingState.Playing &&
             current.deviceId == device.id &&
             activeDevice?.id == device.id &&
-            activeUrl == url
+            activeUrl == url &&
+            activeFraming == framing
         ) {
             return
         }
@@ -94,21 +102,27 @@ class CastingController internal constructor(
         castApp = null
         castMediaSessionId = null
         activeUrl = null
+        activeFraming = null
         // A same-device retry can drop the old socket right away; a switch still needs it to stop.
         if (!switching) previousClient?.close()
 
         activeDevice = device
         activeUrl = url
+        activeFraming = framing
 
         _state.value = CastingState.Connecting(device.id, device.name, device.protocol)
-        android.util.Log.d("Casting", "Casting to ${device.name} (${device.host}): $url")
+        android.util.Log.d(
+            "Casting",
+            "Casting to ${device.name} (${device.host}) framing=$framing: $url",
+        )
         job = scope.launch {
             try {
                 previousStop?.join()
 
                 when (device) {
                     is ChromecastDevice -> playChromecast(device, url, pairingCode)
-                    is RokuDevice -> playRoku(device, rokuUrl(url, width, height), pairingCode)
+                    is RokuDevice ->
+                        playRoku(device, rokuUrl(url, width, height, framing), pairingCode)
                 }
             } catch (cancellation: CancellationException) {
                 throw cancellation
@@ -132,6 +146,7 @@ class CastingController internal constructor(
         cancelJob()
         activeDevice = null
         activeUrl = null
+        activeFraming = null
         castClient = null
         castApp = null
         castMediaSessionId = null
@@ -188,16 +203,31 @@ class CastingController internal constructor(
             pairingCode = pairingCode,
         )
 
-        monitorChromecast(device, client, loaded.app)
+        monitorChromecast(device, client, loaded.app, url)
     }
 
+    /**
+     * Watches a playing receiver and repairs a stuck one.
+     *
+     * A Default Media Receiver can keep a media session forever while showing a black screen and a
+     * spinner: it reports `BUFFERING` (or `PLAYING` with a frozen clock) and never recovers on its
+     * own. Restarting the receiver and loading again is the only reliable way out, and it has to
+     * happen here because [CastV2Client.load] has already returned successfully.
+     */
     private suspend fun monitorChromecast(
         device: ChromecastDevice,
         client: CastV2Client,
-        app: ReceiverApplication,
+        initialApp: ReceiverApplication,
+        url: String,
     ) {
+        var app = initialApp
+        var bufferingSinceMillis = 0L
+        var lastPosition = -1.0
+        var lastProgressAtMillis = System.currentTimeMillis()
+
         while (scope.isActive) {
             delay(MONITOR_INTERVAL_MILLIS)
+            val now = System.currentTimeMillis()
 
             if (client.isClosedByPeer()) {
                 _state.value = CastingState.Failed(
@@ -225,17 +255,93 @@ class CastingController internal constructor(
                 )
                 return
             }
+            if (media == null) continue
+
+            val stalled = when (media.playerState) {
+                "BUFFERING" -> {
+                    if (bufferingSinceMillis == 0L) bufferingSinceMillis = now
+                    now - bufferingSinceMillis >= BUFFER_STALL_MILLIS
+                }
+
+                "PLAYING" -> {
+                    bufferingSinceMillis = 0
+                    if (media.currentTime != lastPosition) {
+                        lastPosition = media.currentTime
+                        lastProgressAtMillis = now
+                        false
+                    } else {
+                        now - lastProgressAtMillis >= PLAYBACK_STALL_MILLIS
+                    }
+                }
+
+                else -> {
+                    bufferingSinceMillis = 0
+                    lastPosition = media.currentTime
+                    lastProgressAtMillis = now
+                    false
+                }
+            }
+
+            if (!stalled) continue
+
+            android.util.Log.d(
+                "Casting",
+                "Playback stalled (${media.playerState} at ${media.currentTime}s); restarting receiver",
+            )
+            val recovered = recoverPlayback(device, client, app, url) ?: return
+            app = recovered
+            bufferingSinceMillis = 0
+            lastPosition = -1.0
+            lastProgressAtMillis = System.currentTimeMillis()
+        }
+    }
+
+    /** Restarts the receiver and loads [url] again. Returns the new app, or null on failure. */
+    private suspend fun recoverPlayback(
+        device: ChromecastDevice,
+        client: CastV2Client,
+        app: ReceiverApplication,
+        url: String,
+    ): ReceiverApplication? {
+        return try {
+            val loaded = withContext(Dispatchers.IO) {
+                client.loadWithRecovery(app, url, forceRestart = true)
+            }
+            castApp = loaded.app
+            castMediaSessionId = loaded.media.mediaSessionId
+            loaded.app
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Exception) {
+            android.util.Log.e("Casting", "Could not recover playback on ${device.name}", error)
+            _state.value = CastingState.Failed(
+                deviceName = device.name,
+                message = "The Chromecast could not play the stream. Try again.",
+            )
+            null
         }
     }
 
     /**
-     * Adds the stream size to the deep-link URL so the Roku channel can fill the screen without
-     * distorting the picture. The HLS server routes on the path, so the extra query is ignored.
+     * Adds the stream size and framing to the deep-link URL so the Roku channel can place the
+     * picture without distortion. The HLS server routes on the path, so the extra query is ignored.
      */
-    private fun rokuUrl(url: String, width: Int, height: Int): String {
-        if (width <= 0 || height <= 0) return url
+    private fun rokuUrl(
+        url: String,
+        width: Int,
+        height: Int,
+        framing: ScreenFraming,
+    ): String {
+        val params = mutableListOf<String>()
+        if (width > 0 && height > 0) {
+            params += "w=$width"
+            params += "h=$height"
+        }
+        if (framing == ScreenFraming.FILL) params += "fill=1"
+        if (params.isEmpty()) return url
+
         val separator = if (url.contains('?')) '&' else '?'
-        return "$url${separator}w=$width&h=$height"
+        return url + separator + params.joinToString("&")
     }
 
     private suspend fun playRoku(device: RokuDevice, url: String, pairingCode: String) {
@@ -312,5 +418,11 @@ class CastingController internal constructor(
     private companion object {
         const val MONITOR_INTERVAL_MILLIS = 2_000L
         const val ROKU_START_GRACE_MILLIS = 4_000L
+
+        /** Long enough to ride out a normal live-edge refill, short enough to not look stuck. */
+        const val BUFFER_STALL_MILLIS = 12_000L
+
+        /** A playing receiver whose clock stopped for this long is frozen, not paused by a user. */
+        const val PLAYBACK_STALL_MILLIS = 20_000L
     }
 }

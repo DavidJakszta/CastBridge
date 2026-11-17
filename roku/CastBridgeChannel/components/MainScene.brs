@@ -193,10 +193,14 @@ sub onRetryTimer()
     StartPlayback()
 end sub
 
-' Fills the 1280x720 screen by scaling the stream to cover it and centring the overflow, cropping
-' the parts of the phone screen that fall outside the TV. Roku always keeps the video's aspect
-' ratio inside the Video node, so the node itself is sized to the stream's aspect ratio and moved
-' partly off-screen to crop.
+' Places the portrait phone screen on the 1280x720 TV screen.
+'
+' Roku always keeps the video's aspect ratio inside the Video node, so the node itself is sized to
+' the stream's aspect ratio and positioned on the scene:
+'   fit  (default) - the whole phone screen is visible, with black bars at the sides.
+'   fill (fill=1)  - the phone screen covers the TV; the top and bottom are cropped.
+' Every value is rounded to whole pixels: a fractional node size or offset makes the scaler jitter,
+' which shows up as the picture shaking.
 sub ApplyGeometry(url as String)
     w = ParseIntParam(url, "w")
     h = ParseIntParam(url, "h")
@@ -205,27 +209,52 @@ sub ApplyGeometry(url as String)
         w = 886
         h = 1920
     end if
+    fill = ParseIntParam(url, "fill") = 1
 
     screenW = 1280.0
     screenH = 720.0
     videoAspect = w / h
     screenAspect = screenW / screenH
 
-    if videoAspect < screenAspect
-        ' Taller than the screen: match the width, crop the top and bottom.
-        nodeW = screenW
-        nodeH = screenW / videoAspect
+    if fill
+        if videoAspect < screenAspect
+            ' Taller than the screen: match the width, crop the top and bottom.
+            nodeW = screenW
+            nodeH = screenW / videoAspect
+        else
+            ' Wider than the screen: match the height, crop the left and right.
+            nodeW = screenH * videoAspect
+            nodeH = screenH
+        end if
     else
-        ' Wider than the screen: match the height, crop the left and right.
-        nodeW = screenH * videoAspect
-        nodeH = screenH
+        if videoAspect < screenAspect
+            ' Taller than the screen: match the height, letterbox left and right.
+            nodeH = screenH
+            nodeW = screenH * videoAspect
+        else
+            ' Wider than the screen: match the width, letterbox top and bottom.
+            nodeW = screenW
+            nodeH = screenW / videoAspect
+        end if
     end if
+
+    nodeW = RoundInt(nodeW)
+    nodeH = RoundInt(nodeH)
+    nodeX = RoundInt((screenW - nodeW) / 2)
+    nodeY = RoundInt((screenH - nodeH) / 2)
 
     m.video.width = nodeW
     m.video.height = nodeH
-    m.video.translation = [(screenW - nodeW) / 2, (screenH - nodeH) / 2]
-    print "CastBridge geometry "; w; "x"; h; " -> "; nodeW; "x"; nodeH; " at "; m.video.translation
+    m.video.translation = [nodeX, nodeY]
+    print "CastBridge geometry "; w; "x"; h; " fill="; fill; " -> "; nodeW; "x"; nodeH; " at "; m.video.translation
 end sub
+
+' Rounds half away from zero. BrightScript's Int() truncates, which would drift the offset by a
+' pixel on negative translations (the fill crop above the screen).
+function RoundInt(value as Float) as Integer
+    if value < 0 then return -Int(-value + 0.5)
+    return Int(value + 0.5)
+end function
 
 function CreateTimer(seconds as Float, repeat as Boolean, handler as String) as Object
     timer = CreateObject("roSGNode", "Timer")

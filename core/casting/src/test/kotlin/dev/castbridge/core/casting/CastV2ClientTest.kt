@@ -50,6 +50,7 @@ class CastV2ClientTest {
 
         assertEquals("PLAYING", media.playerState)
         assertEquals(7L, media.mediaSessionId)
+        assertEquals(12.5, media.currentTime, 0.001)
 
         val connect = device.messages.firstOrNull {
             it.namespace == CastMessage.NS_CONNECTION && it.destinationId == "receiver-0"
@@ -175,6 +176,51 @@ class CastV2ClientTest {
         assertEquals(3, device.launchCount)
     }
 
+    @Test
+    fun `waits through buffering until the receiver is actually playing`() {
+        val device = FakeCastDevice(bufferBeforePlay = true).also { server = it }
+        val active = CastV2Client("127.0.0.1", device.port, plainSocketFactory).also { client = it }
+
+        active.connect()
+        val app = active.launchReceiver()
+
+        val media = active.load(app.transportId, STREAM_URL, timeoutMillis = 3_000)
+
+        // BUFFERING is only a step on the way; returning on it hid an endless TV spinner.
+        assertEquals("PLAYING", media.playerState)
+    }
+
+    @Test
+    fun `treats a receiver stuck on buffering as a failed load`() {
+        val device = FakeCastDevice(stallOnBuffer = true).also { server = it }
+        val active = CastV2Client("127.0.0.1", device.port, plainSocketFactory).also { client = it }
+
+        active.connect()
+        val app = active.launchReceiver()
+
+        val error = runCatching {
+            active.load(app.transportId, STREAM_URL, timeoutMillis = 400)
+        }.exceptionOrNull()
+
+        assertTrue(error is CastProtocolException)
+    }
+
+    @Test
+    fun `force restart replaces a receiver that is already playing`() {
+        val device = FakeCastDevice().also { server = it }
+        val active = CastV2Client("127.0.0.1", device.port, plainSocketFactory).also { client = it }
+
+        active.connect()
+        val app = active.launchReceiver()
+
+        val loaded = active.loadWithRecovery(app, STREAM_URL, forceRestart = true)
+
+        assertEquals("PLAYING", loaded.media.playerState)
+        assertTrue(loaded.app.sessionId != app.sessionId)
+        assertEquals(1, device.loadCount)
+        assertEquals(2, device.launchCount)
+    }
+
     private fun awaitTrue(what: String, timeoutMillis: Long = 3_000, condition: () -> Boolean) {
         val deadline = System.nanoTime() + timeoutMillis * 1_000_000
         while (System.nanoTime() < deadline) {
@@ -193,9 +239,14 @@ private fun receiverStatus(
     """"displayName":"Default Media Receiver","sessionId":"$sessionId","transportId":"$transportId",""" +
     """"statusText":"Ready To Cast","namespaces":[{"name":"urn:x-cast:com.google.cast.media"}]}]}}"""
 
-private fun mediaStatus(sessionId: Long = 7, state: String = "PLAYING"): String =
+private fun mediaStatus(
+    sessionId: Long = 7,
+    state: String = "PLAYING",
+    currentTime: Double = 12.5,
+): String =
     """{"type":"MEDIA_STATUS","requestId":0,"status":[{"mediaSessionId":$sessionId,""" +
-        """"playerState":"$state","idleReason":null,"media":{"contentId":"$STREAM_URL",""" +
+        """"playerState":"$state","currentTime":$currentTime,"idleReason":null,""" +
+        """"media":{"contentId":"$STREAM_URL",""" +
         """"streamType":"LIVE","contentType":"application/x-mpegURL"}}]}"""
 
 /**
@@ -207,6 +258,8 @@ private const val REJECTED_SESSION = 7L
 private class FakeCastDevice(
     private val loadResponse: String? = null,
     private val failLoads: Int = 0,
+    private val bufferBeforePlay: Boolean = false,
+    private val stallOnBuffer: Boolean = false,
 ) {
     private val serverSocket = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
     private val output = AtomicReference<OutputStream?>()
@@ -273,7 +326,17 @@ private class FakeCastDevice(
                         """{"type":"MEDIA_STATUS","status":[{"mediaSessionId":$REJECTED_SESSION,""" +
                             """"playerState":"IDLE","idleReason":"ERROR"}]}""",
                     )
+                } else if (stallOnBuffer) {
+                    // A stuck Default Media Receiver: the session exists and buffers forever.
+                    push(CastMessage.NS_MEDIA, mediaStatus(state = "BUFFERING", currentTime = 0.0))
                 } else {
+                    if (bufferBeforePlay) {
+                        push(
+                            CastMessage.NS_MEDIA,
+                            mediaStatus(state = "BUFFERING", currentTime = 0.0),
+                        )
+                        Thread.sleep(50)
+                    }
                     push(CastMessage.NS_MEDIA, loadResponse ?: mediaStatus())
                 }
             }

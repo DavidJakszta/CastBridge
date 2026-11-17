@@ -23,7 +23,6 @@
 
     <string name="selected_device_label">Selected</string>
     <string name="details">Details</string>
-    <string name="test">Test</string>
     <string name="test_connection">Test connection</string>
     <string name="testing">Testing…</string>
     <string name="connection_reachable">Connected in %1$d ms</string>
@@ -52,7 +51,7 @@
 
     <string name="capture_title">Screen capture</string>
     <string name="capture_subtitle">Validate the encoder that will feed your TV.</string>
-    <string name="capture_idle_body">Records this screen to an MP4 on your phone. Use Live stream below to mirror it to a TV.</string>
+    <string name="capture_idle_body">Records this screen to an MP4 on your phone. To mirror instead, use Mirror to TV below.</string>
     <string name="capture_start">Start recording</string>
     <string name="capture_preparing">Starting capture…</string>
     <string name="capture_finalizing">Finishing recording…</string>
@@ -67,14 +66,15 @@
     <string name="capture_dismiss">Dismiss</string>
     <string name="capture_retry">Try again</string>
 
-    <string name="stream_title">Live stream</string>
-    <string name="stream_subtitle">Mirror this screen to your TV over Wi-Fi.</string>
-    <string name="stream_idle_body">Starts a private HLS link on this phone. Open it on a Chromecast or a Roku channel; no account or internet is required.</string>
+    <string name="stream_title">Mirror to TV</string>
+    <string name="stream_subtitle">Your phone screen on the TV. No account or internet needed.</string>
+    <string name="stream_idle_body">Pick a TV below, then tap Play. Android asks once for permission to share your screen.</string>
 <string name="stream_entire_screen_hint">In the Android dialog, choose &quot;Entire screen&quot;. &quot;Share one app&quot; only mirrors that one app.</string>
-    <string name="stream_start">Start streaming</string>
+    <string name="stream_start_without_tv">Stream without a TV</string>
+    <string name="stream_pending_tv">Starting on %1$s as soon as the stream is ready.</string>
     <string name="stream_preparing">Starting stream…</string>
     <string name="stream_stopping">Stopping stream…</string>
-    <string name="stream_stop">Stop streaming</string>
+    <string name="stream_stop_mirroring">Stop mirroring</string>
     <string name="stream_live">LIVE</string>
     <string name="stream_url_label">Stream link</string>
     <string name="stream_copy_url">Copy link</string>
@@ -82,12 +82,19 @@
     <string name="stream_url_hint">Only works while the stream is running and the TV is on this Wi-Fi.</string>
     <string name="stream_stat_segments">Segments</string>
     <string name="stream_stopped">Stream stopped</string>
-    <string name="stream_start_again">Stream again</string>
     <string name="stream_dismiss">Dismiss</string>
-    <string name="stream_retry">Try again</string>
+
+    <string name="framing_label">Screen fit</string>
+    <string name="framing_fit">Fit</string>
+    <string name="framing_fill">Fill</string>
+    <string name="framing_fit_hint">Shows the whole phone screen, with black bars at the sides.</string>
+    <string name="framing_fill_hint">Fills the TV and crops the top and bottom of the phone screen.</string>
+
+    <string name="play">Play</string>
+    <string name="stop">Stop</string>
 
     <string name="cast_play">Play on %1$s</string>
-    <string name="cast_select_hint">Select a TV above, then tap Play.</string>
+    <string name="cast_select_hint">Select a TV below, then tap Play.</string>
     <string name="cast_connecting">Connecting to %1$s…</string>
     <string name="cast_playing">Playing on %1$s</string>
     <string name="cast_pairing_code">Pairing code %1$s</string>

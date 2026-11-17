@@ -49,8 +49,13 @@ a developer account or an internet connection.
 - Detects when another phone takes over the Chromecast, and stops the session in the app.
 - Switches between TVs directly: picking another TV while casting stops the previous one first, so
   only one screen plays at a time.
-- Fills the TV with the phone screen: the picture is scaled to cover the screen and centre-cropped,
-  so a portrait phone does not leave large black bars on a landscape TV.
+- One action to mirror: pick a TV and tap **Play on …**. Android asks once for screen-capture
+  consent and the stream is sent to that TV as soon as it is playable, so you never have to start a
+  stream and then cast it separately. **Stream without a TV** stays available for a laptop or a
+  manual link.
+- Places the portrait phone screen on a landscape TV without distortion. **Fit** (default) shows the
+  whole phone screen with side bars; **Fill** covers the TV and crops the top and bottom. A Roku can
+  switch between them while playing; a Chromecast letterboxes on its own.
 - Shows the stream link in the app with a one-tap **Copy link** action and live segment/size stats.
 - On Android 14+ the consent dialog offers the system's **single app** or **entire screen** capture
   mode.
@@ -242,6 +247,11 @@ playlist and segments directly from the phone.
    changes, another phone launched an app on the same Chromecast: the app reports that the
    Chromecast was taken over and stops. If the receiver reports `IDLE` with `CANCELLED`, playback was
    stopped on the TV and the app reports that too.
+5. A `LOAD` only counts as successful when the receiver reports `PLAYING`. `BUFFERING` is a step on
+   the way, not a result, and returning on it used to leave the TV on a black screen with a spinner.
+   While playing, the app also watches `currentTime`: a receiver that stays on `BUFFERING` for 12
+   seconds, or stops advancing `currentTime` for 20 seconds, is restarted and the stream loaded
+   again. A stuck picture therefore recovers on its own.
 
 The Cast device presents a self-signed TLS certificate. The client accepts it because the
 connection is local and the Cast v2 handshake does not use the certificate for authentication; the
@@ -254,7 +264,9 @@ unguessable stream token is what protects the stream.
    `POST http://<tv>:8060/launch/dev?contentId=<url-encoded-hls-url>&mediaType=movie`.
 3. `main.brs` passes the deep-link arguments into the scene as a field. The scene builds a
    `ContentNode` with `url` and `streamFormat = "hls"` and assigns it to the `Video` node. (A `Video`
-   node has no `url` field of its own.)
+   node has no `url` field of its own.) The same deep link carries `w`, `h`, and an optional `fill=1`,
+   which the scene uses to place the portrait video on the TV — see
+   [Framing on the TV](#framing-on-the-tv).
 4. Stopping sends a second deep link with `contentId=castbridge-stop`, which stops the video.
 5. The channel is relaunched from scratch on every ECP launch. If the playlist is not ready yet, the
    channel retries up to three times instead of showing a permanent error.
@@ -268,10 +280,13 @@ account or developer registration. See [Install the Roku channel](#install-the-r
 
 ### Switching TVs
 
-Only one TV plays at a time. While casting, selecting another TV shows a **Switch to …** button next
-to **Stop casting**. Switching ends the session on the old TV before the new one is contacted, so the
-previous screen does not keep playing. A failure or stop notice belongs to the TV that produced it,
-so it is cleared as soon as another TV is selected instead of offering a retry on the wrong device.
+Only one TV plays at a time. While casting, selecting another TV shows a **Switch to …** button.
+Switching ends the session on the old TV before the new one is contacted, so the previous screen
+does not keep playing. A failure or stop notice belongs to the TV that produced it, so it is cleared
+as soon as another TV is selected instead of offering a retry on the wrong device.
+
+**Stop** in the selected-TV bar ends the cast *and* the stream behind it. The same control is
+available as **Stop mirroring** in the Mirror to TV card and from the ongoing notification.
 
 ### Pairing code
 
@@ -282,11 +297,20 @@ protected by the per-session stream token, which is 128 random bits and changes 
 
 ### Framing on the TV
 
-The phone screen is usually portrait while the TV is landscape. Roku always preserves the video's
-aspect ratio inside the `Video` node, so the channel sizes the node to the stream's aspect ratio and
-moves the overflow off-screen: the picture **covers** the TV and is **centre-cropped**, with no
-black bars and no distortion. The app passes the stream size as `w`/`h` query parameters, and the
-channel falls back to a portrait assumption for older builds.
+The phone screen is usually portrait while the TV is landscape, and Roku always preserves the video's
+aspect ratio inside the `Video` node. The channel therefore sizes the node to the stream's aspect
+ratio and positions it on the 1280×720 scene:
+
+- **Fit** (default) — the whole phone screen is visible, with black bars at the sides. Nothing is
+  cropped and nothing is distorted.
+- **Fill** — the phone screen covers the TV and the top and bottom are cropped, so a portrait phone
+  fills a landscape TV. Tap **Fill** in the Mirror to TV card while a Roku is playing to switch; the
+  channel is relaunched with the new framing.
+
+The app passes the stream size as `w`/`h` and the fill flag as `fill=1` in the deep link, and the
+channel falls back to a portrait assumption for older builds. Every node size and offset is rounded
+to whole pixels: fractional geometry makes the TV's scaler jitter, which looks like a shaking
+picture.
 
 ### Install the Roku channel
 
@@ -315,7 +339,7 @@ developer registration.
 4. Allow mobile control on the TV: **Settings → System → Advanced system settings → Control by
    mobile apps → Network access**. CastBridge only uses the read-only/launch ECP commands, so the TV
    can stay in **Limited** mode.
-5. Open CastBridge on the phone, start a stream, pick the Roku, and tap **Play on …**.
+5. Open CastBridge on the phone, pick the Roku, and tap **Play on …**.
 
 Re-run `install-channel.ps1` whenever `roku/CastBridgeChannel` changes.
 
@@ -432,7 +456,8 @@ server is contacted.
   playable from a laptop on the same Wi-Fi. The receiver fetches the playlist and the first segment
   directly from the phone; if the phone's server is not reachable, playback fails.
 - **The picture never starts:** the receiver needs a moment to fetch the first segment. Keep the
-  stream running; the app publishes `Live` only after the first complete segment exists.
+  stream running; the app publishes `Live` only after the first complete segment exists. If the
+  receiver stalls on a black screen, CastBridge restarts it automatically after about 12 seconds.
 - **"Another device took over the Chromecast":** someone launched another app on the same Chromecast
   from a different phone. CastBridge stops instead of fighting for the device. Start the cast again
   from your phone to take it back.
@@ -458,9 +483,11 @@ server is contacted.
 - **The picture shows only the pairing code:** the channel is connected but the first segment is not
   ready yet. It retries up to three times and then shows a message. Keep the stream running and tap
   **Play on …** again.
-- **The picture is cropped at the top and bottom:** that is the centre-crop framing used to fill a
-  landscape TV with a portrait phone screen. Nothing is distorted; the edges of the phone UI are
-  simply outside the TV.
+- **The picture is cropped at the top and bottom:** you selected **Fill**, which covers a landscape
+  TV with a portrait phone screen. Switch to **Fit** to see the whole phone screen with side bars.
+- **The picture shakes or looks slightly zoomed:** update the Roku channel. Older builds used
+  fractional geometry, which makes the scaler jitter; the current build rounds every value to whole
+  pixels and defaults to **Fit**.
 - **The Roku is not listed:** confirm the TV is on the same network and "Control by mobile apps" is
   enabled. The app discovers Roku over SSDP (`roku:ecp`) and verifies it with
   `http://<tv>:8060/query/device-info`.
@@ -486,6 +513,8 @@ Unit tests cover:
 - Cast v2 framing and message codec, the pairing-code derivation, and Roku ECP launch/URL encoding.
 - Cast v2 load recovery: a rejected `LOAD` restarts the receiver, a stale media status from the
   rejected session is ignored, and recovery gives up after three rounds.
+- Cast v2 load semantics: `BUFFERING` is not treated as success, a receiver stuck on `BUFFERING`
+  fails the load, and a forced restart replaces a receiver that is already playing.
 
 Discovery transports and the encoder need a real device or a virtual network with multicast support;
 there is no emulator shortcut for SSDP/mDNS visibility or hardware H.264 encoding. Verify the stream

@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -39,6 +40,7 @@ internal data class MediaStatus(
     val mediaSessionId: Long,
     val playerState: String?,
     val idleReason: String?,
+    val currentTime: Double = 0.0,
 )
 
 /**
@@ -158,7 +160,11 @@ internal class CastV2Client(
     }
 
     /**
-     * Loads an HLS playlist and waits until the receiver reports playback.
+     * Loads an HLS playlist and waits until the receiver actually reports playback.
+     *
+     * A Default Media Receiver announces `BUFFERING` almost immediately after a LOAD and can stay
+     * there forever when it is stuck, which looks like an endless spinner on the TV. Only `PLAYING`
+     * counts as success, so a stuck receiver is treated as a failed load rather than a working one.
      *
      * This is a single attempt; [loadWithRecovery] decides what to do when the receiver rejects
      * the stream. Connection failures are reported by [connect] and are not retried here.
@@ -174,6 +180,7 @@ internal class CastV2Client(
         val escapedTitle = jsonString(title)
         // Status from before this LOAD belongs to the session being replaced.
         inbox.clear()
+        mediaStatus = null
         log("LOAD requestId=$requestId url=$url")
         sendJson(
             destinationId = transportId,
@@ -201,7 +208,9 @@ internal class CastV2Client(
                     val status = parseMediaStatus(payload)
                     if (status != null) {
                         mediaStatus = status
-                        if (status.playerState == "PLAYING" || status.playerState == "BUFFERING") {
+                        // BUFFERING is not an outcome: the receiver sends it before playback starts
+                        // and also while it is stuck. Only PLAYING means the stream is on screen.
+                        if (status.playerState == "PLAYING") {
                             return status
                         }
                         // INTERRUPTED describes the item this LOAD replaced, not our load.
@@ -235,8 +244,9 @@ internal class CastV2Client(
         app: ReceiverApplication,
         url: String,
         title: String = "CastBridge",
+        forceRestart: Boolean = false,
     ): LoadedMedia {
-        var current = app
+        var current = if (forceRestart) restartReceiver(app) else app
         var lastError: CastProtocolException? = null
 
         for (attempt in 1..LOAD_ATTEMPTS) {
@@ -474,6 +484,7 @@ internal class CastV2Client(
             mediaSessionId = first.long("mediaSessionId") ?: 0L,
             playerState = first.string("playerState"),
             idleReason = first.string("idleReason"),
+            currentTime = first.double("currentTime") ?: 0.0,
         )
     }
 
@@ -487,6 +498,9 @@ internal class CastV2Client(
 
     private fun JsonObject.long(key: String): Long? =
         runCatching { this[key]?.jsonPrimitive?.longOrNull }.getOrNull()
+
+    private fun JsonObject.double(key: String): Double? =
+        runCatching { this[key]?.jsonPrimitive?.doubleOrNull }.getOrNull()
 
     private fun jsonString(value: String): String =
         buildString {

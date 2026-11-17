@@ -13,6 +13,7 @@ import dev.castbridge.core.capture.CaptureMode
 import dev.castbridge.core.capture.CaptureState
 import dev.castbridge.core.casting.CastingController
 import dev.castbridge.core.casting.CastingState
+import dev.castbridge.core.casting.ScreenFraming
 import dev.castbridge.core.discovery.repository.DeviceDiscoveryRepository
 import dev.castbridge.core.streaming.StreamingState
 import dev.castbridge.core.model.CastDevice
@@ -55,6 +56,9 @@ data class DeviceListUiState(
     val capture: CaptureState = CaptureState.Idle,
     val streaming: StreamingState = StreamingState.Idle,
     val casting: CastingState = CastingState.Idle,
+    val framing: ScreenFraming = ScreenFraming.FIT,
+    /** Set while the stream is starting for a TV the user picked. */
+    val pendingCastDeviceId: String? = null,
 )
 
 sealed interface DeviceListEvent {
@@ -73,6 +77,8 @@ class DeviceListViewModel(
     private val selectedDeviceId = MutableStateFlow<String?>(null)
     private val filter = MutableStateFlow(DeviceFilter.ALL)
     private val probeState = MutableStateFlow(ProbeUiState())
+    private val framing = MutableStateFlow(ScreenFraming.FIT)
+    private val pendingCastDeviceId = MutableStateFlow<String?>(null)
     private var probeJob: Job? = null
 
     private val _events = MutableSharedFlow<DeviceListEvent>(extraBufferCapacity = 2)
@@ -82,20 +88,36 @@ class DeviceListViewModel(
         val capture: CaptureState,
         val streaming: StreamingState,
         val casting: CastingState,
+        val framing: ScreenFraming,
+        val pendingCastDeviceId: String?,
     )
 
     private val sessionUi = combine(
         captureController.state,
         captureController.streamingState,
         castingController.state,
-    ) { capture, streaming, casting -> SessionUi(capture, streaming, casting) }
+    ) { capture, streaming, casting -> SessionUi(capture, streaming, casting, framing.value, null) }
+
+    private val playUi = combine(
+        sessionUi,
+        framing,
+        pendingCastDeviceId,
+    ) { session, activeFraming, pending ->
+        session.copy(framing = activeFraming, pendingCastDeviceId = pending)
+    }
 
     init {
-        // A cast session cannot outlive the stream it plays.
+        // The stream and the TV session are one feature: when the stream ends, nothing is left to
+        // play, and when the user asks for a TV the stream is cast as soon as it is playable.
         viewModelScope.launch {
             captureController.streamingState.collect { streaming ->
-                if (streaming is StreamingState.Stopped || streaming is StreamingState.Failed) {
-                    castingController.stopIfActive()
+                when (streaming) {
+                    is StreamingState.Live -> castPending(streaming)
+                    is StreamingState.Stopped, is StreamingState.Failed -> {
+                        pendingCastDeviceId.value = null
+                        castingController.stopIfActive()
+                    }
+                    else -> Unit
                 }
             }
         }
@@ -106,7 +128,7 @@ class DeviceListViewModel(
         selectedDeviceId,
         filter,
         probeState,
-        sessionUi,
+        playUi,
     ) { discovery, selectedId, activeFilter, probe, session ->
         val selected = discovery.devices.firstOrNull { it.id == selectedId }
         val visible = when (activeFilter) {
@@ -132,6 +154,8 @@ class DeviceListViewModel(
             capture = session.capture,
             streaming = session.streaming,
             casting = session.casting,
+            framing = session.framing,
+            pendingCastDeviceId = session.pendingCastDeviceId,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -159,7 +183,11 @@ class DeviceListViewModel(
 
         // A failure or stop notice belongs to the TV that produced it. Keeping it while another TV
         // is selected would make "Try again" cast somewhere the message is not about.
-        if (next != previous) castingController.reset()
+        if (next != previous) {
+            castingController.reset()
+            // A stream that is still starting was requested for the previous TV.
+            pendingCastDeviceId.value = null
+        }
     }
 
     fun selectFilter(newFilter: DeviceFilter) {
@@ -216,10 +244,99 @@ class DeviceListViewModel(
         captureController.resetStreaming()
     }
 
+    /**
+     * The single "play" action: starts mirroring the screen to the selected TV.
+     *
+     * When nothing is streaming yet the UI has to ask Android for screen-capture consent first, so
+     * this returns true and the caller launches the system dialog. The TV is remembered and the
+     * stream is cast automatically once it is live, which is why the user never has to tell
+     * "streaming" and "casting" apart.
+     */
+    fun playOnSelected(): Boolean {
+        val state = uiState.value
+        val device = state.selectedDevice ?: return false
+
+        return when (val streaming = state.streaming) {
+            is StreamingState.Live -> {
+                pendingCastDeviceId.value = null
+                castingController.cast(
+                    device = device,
+                    streamUrl = streaming.url,
+                    width = streaming.stats.width,
+                    height = streaming.stats.height,
+                    framing = framing.value,
+                )
+                false
+            }
+
+            StreamingState.Preparing -> {
+                pendingCastDeviceId.value = device.id
+                false
+            }
+
+            // The old session is still tearing down; a new capture request would be dropped.
+            StreamingState.Stopping -> false
+
+            else -> {
+                if (state.capture.isActive()) return false
+                pendingCastDeviceId.value = device.id
+                true
+            }
+        }
+    }
+
+    /** Stops the TV session and the stream behind it. */
+    fun stopMirroring() {
+        pendingCastDeviceId.value = null
+        castingController.stop()
+        captureController.stop()
+    }
+
+    /** Changes how a Roku places the portrait phone screen on the TV. */
+    fun setFraming(next: ScreenFraming) {
+        if (framing.value == next) return
+        framing.value = next
+
+        // Chromecast letterboxes by itself, so only a running Roku needs to be told again.
+        val state = uiState.value
+        val playing = state.casting as? CastingState.Playing ?: return
+        if (playing.protocol != CastProtocol.ROKU) return
+
+        val live = state.streaming as? StreamingState.Live ?: return
+        val device = repository.state.value.devices.firstOrNull { it.id == playing.deviceId } ?: return
+        castingController.cast(
+            device = device,
+            streamUrl = live.url,
+            width = live.stats.width,
+            height = live.stats.height,
+            framing = next,
+        )
+    }
+
+    private fun castPending(live: StreamingState.Live) {
+        val deviceId = pendingCastDeviceId.value ?: return
+        pendingCastDeviceId.value = null
+
+        val device = repository.state.value.devices.firstOrNull { it.id == deviceId } ?: return
+        castingController.cast(
+            device = device,
+            streamUrl = live.url,
+            width = live.stats.width,
+            height = live.stats.height,
+            framing = framing.value,
+        )
+    }
+
     fun castToSelected() {
         val device = uiState.value.selectedDevice ?: return
         val live = uiState.value.streaming as? StreamingState.Live ?: return
-        castingController.cast(device, live.url, live.stats.width, live.stats.height)
+        castingController.cast(
+            device = device,
+            streamUrl = live.url,
+            width = live.stats.width,
+            height = live.stats.height,
+            framing = framing.value,
+        )
     }
 
     fun stopCasting() {
@@ -250,3 +367,8 @@ class DeviceListViewModel(
         }
     }
 }
+
+private fun CaptureState.isActive(): Boolean =
+    this is CaptureState.Preparing ||
+        this is CaptureState.Running ||
+        this is CaptureState.Finalizing
