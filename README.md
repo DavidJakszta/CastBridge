@@ -119,8 +119,8 @@ when you start a recording or stream. No backend, account, analytics, or cloud s
 WebRTC would need a registered custom Web Receiver, static HTTPS hosting, and an internet round trip
 before the TV can show anything, so it cannot work on a LAN without internet. HLS is playable by the
 Chromecast's built-in Default Media Receiver (`CC1AD845`) and by a side-loaded Roku channel, needs no
-registration, and works entirely on the local network. The trade-off is a few seconds of latency,
-which this project accepts.
+registration, and works entirely on the local network. The trade-off is roughly eight to ten seconds
+of latency, which this project accepts because a stable picture matters more than a short delay.
 
 ## How discovery works
 
@@ -195,17 +195,23 @@ recording session is capped at 30 minutes to bound file size and encoder uptime.
    each segment is independently decodable.
 3. **Samples are cut into segments at keyframes.** `HlsSegmenter` only closes a segment on a
    keyframe and when the target duration has elapsed. The default target is 1.5 seconds with a
-   two-second keyframe interval, which yields roughly two-second segments and a 3–6 second
-   glass-to-glass delay.
+   two-second keyframe interval, which yields roughly two-second segments. The receiver starts about
+   six seconds behind the live edge so it has runway to buffer, which puts glass-to-glass delay at
+   roughly eight to ten seconds.
 4. **`MpegTsMuxer` writes MPEG-TS.** Every segment starts with a PAT and PMT, uses H.264 stream type
    `0x1B`, carries a PCR and random-access indicator on the first packet of each keyframe, and
    maintains per-PID continuity counters. Timestamps are rebased so the first PTS is zero. A silent
    AAC-LC track (stream type `0x0F`, PID `0x0101`) is muxed alongside the video: the Chromecast
    Default Media Receiver rejects a video-only transport stream. The audio frames are generated once
    by the platform AAC encoder and then looped, so no second encoder runs during the session.
-5. **`HlsMediaStore` builds the live playlist.** It advertises a four-segment window, keeps eight
-   segments for players that are one request behind, advances `EXT-X-MEDIA-SEQUENCE`, and writes
-   millisecond `EXTINF` values plus `EXT-X-INDEPENDENT-SEGMENTS`.
+5. **`HlsMediaStore` builds the live playlist.** It advertises a six-segment window (about twelve
+   seconds), keeps ten segments for players that are one request behind, advances
+   `EXT-X-MEDIA-SEQUENCE`, and writes millisecond `EXTINF` values plus
+   `EXT-X-INDEPENDENT-SEGMENTS`. It also writes `EXT-X-START` with a negative offset, which asks the
+   player to begin a few seconds *behind* the live edge. That tag matters: this phone produces
+   segments in real time, so a receiver that starts on the newest segment has zero seconds of runway
+   and can never build a buffer. Such a player spends its life alternating between playing and
+   rebuffering, which looks like a permanent loading spinner on the TV.
 6. **`HlsHttpServer` serves the token path.** It binds to the phone's Wi-Fi IPv4 address only and
    answers only `/s/<32-hex-token>/…`, with correct playlist/segment content types, `HEAD`, and byte
    ranges (including suffix ranges). Everything else is a 404.
@@ -242,11 +248,16 @@ playlist and segments directly from the phone.
    segments straight from the phone. A receiver that lost its previous stream can get stuck and keep
    answering `LOAD` with `LOAD_FAILED` even though the stream is fine, so a rejected `LOAD` ends the
    receiver session (`STOP`), launches a fresh one, and tries again — up to three rounds. The app then
-   tracks the receiver session that actually started playing.
-4. While playing, the client polls `RECEIVER_STATUS` and `MEDIA_STATUS`. If the receiver session ID
-   changes, another phone launched an app on the same Chromecast: the app reports that the
-   Chromecast was taken over and stops. If the receiver reports `IDLE` with `CANCELLED`, playback was
-   stopped on the TV and the app reports that too.
+   tracks the receiver session that actually started playing. The `LOAD` deliberately omits
+   `currentTime`: for live content an explicit `0` pins the receiver to the live edge, while leaving
+   it out lets the player honour the playlist's `EXT-X-START` offset.
+4. While playing, the client polls `RECEIVER_STATUS` and actively requests `MEDIA_STATUS` with
+   `GET_STATUS`. A Default Media Receiver only broadcasts a status when something changes and stays
+   silent while playback is healthy, so a watchdog that merely listens cannot tell "playing" from
+   "frozen" and would restart a working stream. If the receiver session ID changes, another phone
+   launched an app on the same Chromecast: the app reports that the Chromecast was taken over and
+   stops. If the receiver reports `IDLE` with `CANCELLED`, playback was stopped on the TV and the app
+   reports that too.
 5. A `LOAD` only counts as successful when the receiver reports `PLAYING`. `BUFFERING` is a step on
    the way, not a result, and returning on it used to leave the TV on a black screen with a spinner.
    While playing, the app also watches `currentTime`: a receiver that stays on `BUFFERING` for 12
@@ -439,8 +450,10 @@ server is contacted.
   stream is live; stopping the stream closes the port.
 - **The link returns 404:** copy the full URL from the app, including the 32-character token after
   `/s/`. A link from an earlier session will not work because the token and port change.
-- **Playback stalls or rebuffers:** HLS keeps a four-segment window. If the TV is slow to start,
-  keep the stream running for a few seconds; the playlist fills as segments are produced.
+- **Playback stalls or rebuffers:** HLS keeps a six-segment window (about twelve seconds) and asks
+  the player to start a few seconds behind the live edge, so a receiver has runway to buffer. If the
+  TV is slow to start, keep the stream running for a few seconds; the playlist fills as segments are
+  produced.
 - **The picture is black:** protected content (banking apps, DRM video) is blanked by the OS. This is
   expected and is not bypassed by CastBridge.
 - **The stream stops when the phone locks:** keep the phone awake while streaming. Android may stop
@@ -507,7 +520,10 @@ Unit tests cover:
 - Capture config validation, timestamped file naming, and locale-independent stat formatting.
 - Annex-B/AVCC normalisation, PAT/PMT/PES/PCR layout, CRC, continuity counters, and PTS rebasing.
 - Keyframe-only segment cuts, sequence naming, SPS/PPS repetition, and final partial segments.
-- Playlist window, media-sequence advance, retention, target duration, and `EXT-X-ENDLIST`.
+- Playlist window, media-sequence advance, retention, target duration, `EXT-X-START`, and
+  `EXT-X-ENDLIST`.
+- H.264 level selection: a stream must never declare a level lower than its real macroblock rate, so
+  the encoder's frame-rate cap and the declared level are checked together.
 - Token enforcement, content types, `HEAD`, byte ranges, suffix ranges, and error responses.
 - An end-to-end loopback session that serves a real playlist and MPEG-TS segment over HTTP.
 - Cast v2 framing and message codec, the pairing-code derivation, and Roku ECP launch/URL encoding.

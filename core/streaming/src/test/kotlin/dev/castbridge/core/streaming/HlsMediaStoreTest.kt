@@ -58,6 +58,39 @@ class HlsMediaStoreTest {
         assertTrue(store.playlist().contains("#EXTINF:1.500,"))
     }
 
+    /**
+     * A receiver that starts on the newest segment has no runway at all, because this phone
+     * produces segments in real time. The start tag makes it open a few seconds behind live.
+     */
+    @Test
+    fun `live playlist asks the player to start behind the live edge`() {
+        val store = HlsMediaStore()
+        repeat(HlsMediaStore.DEFAULT_PLAYLIST_WINDOW) { store.add(segment(it, 2_000_000)) }
+
+        val playlist = store.playlist()
+
+        // Six 2 s segments leave 12 s, minus the 4 s margin.
+        assertTrue(playlist.contains("#EXT-X-START:TIME-OFFSET=-8"))
+        assertEquals(6, playlist.lines().count { it.startsWith("segment") })
+    }
+
+    @Test
+    fun `a short playlist does not ask for a negative start offset`() {
+        val store = HlsMediaStore()
+        store.add(segment(0, 2_000_000))
+
+        assertFalse(store.playlist().contains("#EXT-X-START"))
+    }
+
+    @Test
+    fun `a finished stream starts from its beginning`() {
+        val store = HlsMediaStore()
+        repeat(6) { store.add(segment(it, 2_000_000)) }
+        store.markEnded()
+
+        assertFalse(store.playlist().contains("#EXT-X-START"))
+    }
+
     private fun segment(sequence: Int, durationUs: Long): HlsSegment = HlsSegment(
         sequence = sequence,
         name = "segment$sequence.ts",

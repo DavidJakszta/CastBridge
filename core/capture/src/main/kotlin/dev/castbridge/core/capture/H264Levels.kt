@@ -8,8 +8,22 @@ import android.media.MediaCodecInfo
  * Encoders otherwise advertise the highest level they support: Samsung reports level 5.2 for a
  * portrait 886x1920 stream. Cast receivers only accept up to level 4.2, so advertising the level the
  * content actually needs keeps the SPS inside the range TVs expect.
+ *
+ * Under-declaring is worse than over-declaring: 886x1920 at 59 fps needs 403k macroblocks per
+ * second, so a stream that claims level 4.0 (245k) while carrying that many is invalid and strict
+ * receivers refuse to play it. Callers must therefore pass the highest frame rate the encoder can
+ * really emit, not the rate they asked for.
  */
 internal object H264Levels {
+    /**
+     * The highest frame rate a mirrored display can hand the encoder.
+     *
+     * Surface input is paced by the display, not by [android.media.MediaFormat.KEY_FRAME_RATE], so
+     * a mirrored 60 Hz screen can carry this many frames per second even when 30 are requested.
+     * Whenever the platform cannot cap the encoder, the declared level has to cover this rate.
+     */
+    const val SURFACE_INPUT_CEILING_FPS = 60
+
     private class Level(
         val code: Int,
         val maxFrameSize: Int,

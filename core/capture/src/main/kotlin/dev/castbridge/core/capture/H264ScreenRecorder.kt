@@ -5,6 +5,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -318,6 +319,7 @@ internal class H264ScreenRecorder(
             setInteger(MediaFormat.KEY_BIT_RATE, config.bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.keyFrameIntervalSeconds)
+            capFrameRate()
             if (withLevelOverrides) {
                 setInteger(
                     MediaFormat.KEY_PROFILE,
@@ -325,9 +327,45 @@ internal class H264ScreenRecorder(
                 )
                 setInteger(
                     MediaFormat.KEY_LEVEL,
-                    H264Levels.forFrame(config.width, config.height, config.frameRate),
+                    H264Levels.forFrame(config.width, config.height, declaredFrameRate),
                 )
             }
+        }
+
+    /**
+     * Makes the encoder drop source frames above [CaptureConfig.frameRate].
+     *
+     * The virtual display mirrors a 60 Hz (or faster) screen, so it hands the encoder roughly twice
+     * as many frames as requested regardless of [MediaFormat.KEY_FRAME_RATE]. Encoding all of them
+     * has three bad consequences:
+     *
+     *  * the SPS then describes a stream that is faster than the level we advertise, which strict
+     *    receivers such as the Cast Default Media Receiver reject outright;
+     *  * 59.x fps on a 60 Hz TV repeats a frame every second or so, which reads as judder;
+     *  * twice as many IDRs per segment steals bitrate from the frames in between, so the picture
+     *    visibly pumps in sharpness.
+     *
+     * Dropping happens before encoding, so no reference frame is ever removed.
+     */
+    private fun MediaFormat.capFrameRate() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, config.frameRate.toFloat())
+        }
+    }
+
+    /**
+     * The frame rate the encoder is actually allowed to emit, used to pick the H.264 level.
+     *
+     * Declaring a level for fewer frames than the stream really contains produces an invalid
+     * bitstream: a 886x1920 frame at 59 fps needs 403k macroblocks/s, which is level 4.2, not the
+     * level 4.0 that 30 fps would justify. Below Android 10 there is no way to cap the encoder, so
+     * the ceiling of a mirrored display is assumed instead.
+     */
+    private val declaredFrameRate: Int
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            config.frameRate
+        } else {
+            H264Levels.SURFACE_INPUT_CEILING_FPS
         }
 
     /**

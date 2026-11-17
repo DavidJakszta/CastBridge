@@ -186,7 +186,11 @@ internal class CastV2Client(
             destinationId = transportId,
             namespace = CastMessage.NS_MEDIA,
             payload = buildString {
-                append("""{"type":"LOAD","requestId":$requestId,"autoplay":true,"currentTime":0,"media":{""")
+                // No currentTime: for live content an explicit 0 pins the receiver to the live
+                // edge, where it has zero seconds of runway and can only rebuffer. Leaving the
+                // position out lets the player use the playlist's #EXT-X-START instead, which
+                // points a few seconds behind the edge.
+                append("""{"type":"LOAD","requestId":$requestId,"autoplay":true,"media":{""")
                 append(""""contentId":$escapedUrl,"streamType":"LIVE","contentType":"application/x-mpegURL",""")
                 append(""""metadata":{"metadataType":0,"title":$escapedTitle},"customData":{}}}""")
             },
@@ -309,6 +313,38 @@ internal class CastV2Client(
     fun receiverStatus(): ReceiverStatus? = receiverStatus
 
     fun mediaStatus(): MediaStatus? = mediaStatus
+
+    /**
+     * Asks the receiver for its media status and waits for the answer.
+     *
+     * A Default Media Receiver broadcasts `MEDIA_STATUS` only when something changes, and stays
+     * completely silent while playback is healthy. A watchdog that just listens cannot tell
+     * "playing normally" from "frozen", so it has to poll to see the clock move.
+     *
+     * Falls back to the last broadcast status when the receiver does not answer in time.
+     */
+    fun pollMediaStatus(
+        transportId: String,
+        timeoutMillis: Long = STATUS_TIMEOUT_MILLIS,
+    ): MediaStatus? {
+        val requestId = requestIds.getAndIncrement()
+        sendJson(
+            destinationId = transportId,
+            namespace = CastMessage.NS_MEDIA,
+            payload = """{"type":"GET_STATUS","requestId":$requestId}""",
+        )
+
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        while (System.nanoTime() < deadline) {
+            val message = inbox.poll(POLL_SLICE_MILLIS, TimeUnit.MILLISECONDS) ?: continue
+            if (message.namespace != CastMessage.NS_MEDIA) continue
+            val payload = parseObject(message.payloadUtf8) ?: continue
+            if (payload.string("type") != "MEDIA_STATUS") continue
+            val status = parseMediaStatus(payload) ?: continue
+            return status
+        }
+        return mediaStatus
+    }
 
     fun isClosedByPeer(): Boolean = closedByPeer
 
@@ -538,5 +574,6 @@ internal class CastV2Client(
         private const val RESTART_PAUSE_MILLIS = 1_500L
         private const val RESTART_LAUNCH_TIMEOUT_MILLIS = 10_000L
         private const val HEARTBEAT_INTERVAL_MILLIS = 5_000L
+        private const val STATUS_TIMEOUT_MILLIS = 2_000L
     }
 }

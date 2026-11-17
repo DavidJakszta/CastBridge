@@ -247,7 +247,7 @@ class CastingController internal constructor(
                 return
             }
 
-            val media = client.mediaStatus()
+            val media = client.pollMediaStatus(app.transportId)
             if (media?.playerState == "IDLE" && media.idleReason == "CANCELLED") {
                 _state.value = CastingState.Failed(
                     deviceName = device.name,
