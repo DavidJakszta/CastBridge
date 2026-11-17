@@ -164,14 +164,15 @@ class CastingController internal constructor(
         val client = castClientFactory(device)
         castClient = client
 
-        val app = withContext(Dispatchers.IO) {
+        val launched = withContext(Dispatchers.IO) {
             client.connect()
             client.launchReceiver()
         }
-        castApp = app
+        castApp = launched
 
-        val media = withContext(Dispatchers.IO) { client.load(app.transportId, url) }
-        castMediaSessionId = media.mediaSessionId
+        val loaded = withContext(Dispatchers.IO) { client.loadWithRecovery(launched, url) }
+        castApp = loaded.app
+        castMediaSessionId = loaded.media.mediaSessionId
 
         _state.value = CastingState.Playing(
             deviceId = device.id,
@@ -180,7 +181,7 @@ class CastingController internal constructor(
             pairingCode = pairingCode,
         )
 
-        monitorChromecast(device, client, app)
+        monitorChromecast(device, client, loaded.app)
     }
 
     private suspend fun monitorChromecast(

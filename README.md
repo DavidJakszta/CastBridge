@@ -232,7 +232,10 @@ playlist and segments directly from the phone.
    Media Receiver** (`CC1AD845`). That receiver is already on the device, so nothing is registered or
    uploaded.
 3. It sends `LOAD` on the media namespace with the HLS URL. The receiver fetches the playlist and
-   segments straight from the phone.
+   segments straight from the phone. A receiver that lost its previous stream can get stuck and keep
+   answering `LOAD` with `LOAD_FAILED` even though the stream is fine, so a rejected `LOAD` ends the
+   receiver session (`STOP`), launches a fresh one, and tries again — up to three rounds. The app then
+   tracks the receiver session that actually started playing.
 4. While playing, the client polls `RECEIVER_STATUS` and `MEDIA_STATUS`. If the receiver session ID
    changes, another phone launched an app on the same Chromecast: the app reports that the
    Chromecast was taken over and stops. If the receiver reports `IDLE` with `CANCELLED`, playback was
@@ -429,6 +432,11 @@ server is contacted.
 - **The stream is rejected (`LOAD_FAILED` / `idleReason: ERROR`):** the Default Media Receiver
   requires an audio track and accepts H.264 only up to level 4.2. CastBridge muxes a silent AAC track
   and asks the encoder for the lowest sufficient level; if you changed the encoder, verify both.
+- **A previously working stream is suddenly refused:** a receiver that was interrupted can stay
+  stuck and reject every `LOAD` for a minute or more. CastBridge handles this by restarting the
+  receiver app (end the session, launch it again) and loading the stream on the fresh session. If
+  even that fails three times, the TV itself is the problem — unplug it or check that the phone's
+  stream is still reachable from a laptop.
 
 ### Roku
 
@@ -467,6 +475,8 @@ Unit tests cover:
 - Token enforcement, content types, `HEAD`, byte ranges, suffix ranges, and error responses.
 - An end-to-end loopback session that serves a real playlist and MPEG-TS segment over HTTP.
 - Cast v2 framing and message codec, the pairing-code derivation, and Roku ECP launch/URL encoding.
+- Cast v2 load recovery: a rejected `LOAD` restarts the receiver, a stale media status from the
+  rejected session is ignored, and recovery gives up after three rounds.
 
 Discovery transports and the encoder need a real device or a virtual network with multicast support;
 there is no emulator shortcut for SSDP/mDNS visibility or hardware H.264 encoding. Verify the stream

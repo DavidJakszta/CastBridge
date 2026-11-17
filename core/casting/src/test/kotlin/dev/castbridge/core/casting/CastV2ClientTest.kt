@@ -9,6 +9,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -122,6 +123,38 @@ class CastV2ClientTest {
         assertEquals("INVALID_MEDIA", error?.message)
     }
 
+    @Test
+    fun `restarts the receiver when it keeps rejecting the stream`() {
+        val device = FakeCastDevice(failLoads = 1).also { server = it }
+        val active = CastV2Client("127.0.0.1", device.port, plainSocketFactory).also { client = it }
+
+        active.connect()
+        val app = active.launchReceiver()
+
+        val loaded = active.loadWithRecovery(app, STREAM_URL)
+
+        assertEquals("PLAYING", loaded.media.playerState)
+        // The stuck app was replaced by a fresh one before the stream was accepted.
+        assertTrue(loaded.app.sessionId != app.sessionId)
+        assertEquals(2, device.loadCount)
+        assertEquals(2, device.launchCount)
+    }
+
+    @Test
+    fun `gives up after restarting the receiver twice`() {
+        val device = FakeCastDevice(failLoads = 9).also { server = it }
+        val active = CastV2Client("127.0.0.1", device.port, plainSocketFactory).also { client = it }
+
+        active.connect()
+        val app = active.launchReceiver()
+
+        val error = runCatching { active.loadWithRecovery(app, STREAM_URL) }.exceptionOrNull()
+
+        assertTrue(error is CastProtocolException)
+        assertEquals(3, device.loadCount)
+        assertEquals(3, device.launchCount)
+    }
+
     private fun awaitTrue(what: String, timeoutMillis: Long = 3_000, condition: () -> Boolean) {
         val deadline = System.nanoTime() + timeoutMillis * 1_000_000
         while (System.nanoTime() < deadline) {
@@ -140,17 +173,27 @@ private fun receiverStatus(
     """"displayName":"Default Media Receiver","sessionId":"$sessionId","transportId":"$transportId",""" +
     """"statusText":"Ready To Cast","namespaces":[{"name":"urn:x-cast:com.google.cast.media"}]}]}}"""
 
-private fun mediaStatus(): String =
-    """{"type":"MEDIA_STATUS","requestId":0,"status":[{"mediaSessionId":7,""" +
-        """"playerState":"PLAYING","idleReason":null,"media":{"contentId":"$STREAM_URL",""" +
+private fun mediaStatus(sessionId: Long = 7, state: String = "PLAYING"): String =
+    """{"type":"MEDIA_STATUS","requestId":0,"status":[{"mediaSessionId":$sessionId,""" +
+        """"playerState":"$state","idleReason":null,"media":{"contentId":"$STREAM_URL",""" +
         """"streamType":"LIVE","contentType":"application/x-mpegURL"}}]}"""
 
-private class FakeCastDevice(private val loadResponse: String? = null) {
+/** A media session id used by the fake receiver for loads it rejects. */
+private const val REJECTED_SESSION = 99L
+
+private class FakeCastDevice(
+    private val loadResponse: String? = null,
+    private val failLoads: Int = 0,
+) {
     private val serverSocket = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
     private val output = AtomicReference<OutputStream?>()
+    private val loads = AtomicInteger(0)
+    private val launches = AtomicInteger(0)
 
     val messages = CopyOnWriteArrayList<CastMessage>()
     val port: Int get() = serverSocket.localPort
+    val loadCount: Int get() = loads.get()
+    val launchCount: Int get() = launches.get()
 
     private val worker = Thread({ serve() }, "FakeCastDevice").apply {
         isDaemon = true
@@ -179,15 +222,47 @@ private class FakeCastDevice(private val loadResponse: String? = null) {
     private fun respond(message: CastMessage) {
         val payload = message.payloadUtf8.orEmpty()
         when {
-            payload.contains("\"LAUNCH\"") -> push(
+            payload.contains("\"LAUNCH\"") -> {
+                val session = launches.incrementAndGet()
+                push(
+                    CastMessage.NS_RECEIVER,
+                    receiverStatus("session-$session", "transport-$session"),
+                )
+            }
+
+            message.namespace == CastMessage.NS_RECEIVER && payload.contains("\"STOP\"") -> push(
                 CastMessage.NS_RECEIVER,
-                receiverStatus("session-1", "transport-1"),
+                """{"type":"RECEIVER_STATUS","requestId":0,"status":{"applications":[]}}""",
             )
 
-            payload.contains("\"LOAD\"") -> push(
-                CastMessage.NS_MEDIA,
-                loadResponse ?: mediaStatus(),
-            )
+            payload.contains("\"LOAD\"") -> {
+                val attempt = loads.getAndIncrement()
+                if (attempt < failLoads) {
+                    // Mirror a real receiver: announce the rejected session, reject the load, then
+                    // keep broadcasting that session's error state for a moment.
+                    push(CastMessage.NS_MEDIA, mediaStatus(sessionId = REJECTED_SESSION, state = "IDLE"))
+                    push(
+                        CastMessage.NS_MEDIA,
+                        """{"type":"LOAD_FAILED","requestId":1,"reason":"LOAD_FAILED"}""",
+                    )
+                    push(
+                        CastMessage.NS_MEDIA,
+                        """{"type":"MEDIA_STATUS","status":[{"mediaSessionId":$REJECTED_SESSION,""" +
+                            """"playerState":"IDLE","idleReason":"ERROR"}]}""",
+                    )
+                } else {
+                    if (attempt > 0) {
+                        // A late broadcast for the rejected session, delivered just before the
+                        // retry's result. Without filtering it would be read as a failed retry.
+                        push(
+                            CastMessage.NS_MEDIA,
+                            """{"type":"MEDIA_STATUS","status":[{"mediaSessionId":$REJECTED_SESSION,""" +
+                                """"playerState":"IDLE","idleReason":"ERROR"}]}""",
+                        )
+                    }
+                    push(CastMessage.NS_MEDIA, loadResponse ?: mediaStatus())
+                }
+            }
 
             payload.contains("\"PING\"") -> push(
                 CastMessage.NS_HEARTBEAT,

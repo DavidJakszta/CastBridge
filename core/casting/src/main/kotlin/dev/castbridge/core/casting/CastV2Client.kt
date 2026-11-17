@@ -8,6 +8,7 @@ import java.io.DataInputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -39,6 +40,15 @@ internal data class MediaStatus(
     val mediaSessionId: Long,
     val playerState: String?,
     val idleReason: String?,
+)
+
+/**
+ * The receiver app and media that ended up playing. The app can differ from the one that was
+ * launched originally when a rejected load had to be recovered by restarting the receiver.
+ */
+internal data class LoadedMedia(
+    val app: ReceiverApplication,
+    val media: MediaStatus,
 )
 
 internal class CastProtocolException(message: String, cause: Throwable? = null) :
@@ -75,6 +85,13 @@ internal class CastV2Client(
 
     @Volatile
     private var lastError: String? = null
+
+    /**
+     * Media session ids from earlier LOAD attempts. The receiver keeps broadcasting the state of a
+     * rejected session for a moment, and those late messages must not be mistaken for the result of
+     * the next attempt. Written by the load thread, read by the reader thread.
+     */
+    private val retiredMediaSessions = ConcurrentHashMap.newKeySet<Long>()
 
     private var socket: Socket? = null
     private var output: OutputStream? = null
@@ -115,6 +132,8 @@ internal class CastV2Client(
         appId: String = DEFAULT_MEDIA_RECEIVER_ID,
         timeoutMillis: Long = LAUNCH_TIMEOUT_MILLIS,
     ): ReceiverApplication {
+        // Receiver status from before this LAUNCH is not an answer to it.
+        inbox.clear()
         val requestId = requestIds.getAndIncrement()
         sendJson(
             destinationId = RECEIVER_ID,
@@ -146,7 +165,12 @@ internal class CastV2Client(
         )
     }
 
-    /** Loads an HLS playlist and waits until the receiver reports playback. */
+    /**
+     * Loads an HLS playlist and waits until the receiver reports playback.
+     *
+     * This is a single attempt; [loadWithRecovery] decides what to do when the receiver rejects
+     * the stream. Connection failures are reported by [connect] and are not retried here.
+     */
     fun load(
         transportId: String,
         url: String,
@@ -156,6 +180,8 @@ internal class CastV2Client(
         val requestId = requestIds.getAndIncrement()
         val escapedUrl = jsonString(url)
         val escapedTitle = jsonString(title)
+        // Status from before this LOAD belongs to the session being replaced.
+        inbox.clear()
         log("LOAD requestId=$requestId url=$url")
         sendJson(
             destinationId = transportId,
@@ -182,11 +208,17 @@ internal class CastV2Client(
                 "MEDIA_STATUS" -> {
                     val status = parseMediaStatus(payload)
                     if (status != null) {
+                        // A session we already abandoned can keep broadcasting for a moment.
+                        if (status.mediaSessionId in retiredMediaSessions) continue
                         mediaStatus = status
                         if (status.playerState == "PLAYING" || status.playerState == "BUFFERING") {
                             return status
                         }
-                        if (status.playerState == "IDLE" && status.idleReason != null) {
+                        // INTERRUPTED describes the item this LOAD replaced, not our load.
+                        if (status.playerState == "IDLE" &&
+                            status.idleReason != null &&
+                            status.idleReason != "INTERRUPTED"
+                        ) {
                             throw CastProtocolException(
                                 "The Chromecast stopped playback (${status.idleReason}).",
                             )
@@ -199,6 +231,62 @@ internal class CastV2Client(
         throw CastProtocolException(
             lastError ?: "The Chromecast did not start playing the stream in time.",
         )
+    }
+
+    /**
+     * Loads [url] on [app], restarting the receiver if it rejects the stream.
+     *
+     * A Default Media Receiver that lost its previous stream can stay stuck: it keeps answering
+     * LOAD with LOAD_FAILED until the app itself is restarted, and reloading on the same session
+     * does not help. So a rejected load ends the receiver session, launches a fresh one, and tries
+     * again. The returned app is the one that is actually playing, which can be a new session.
+     */
+    fun loadWithRecovery(
+        app: ReceiverApplication,
+        url: String,
+        title: String = "CastBridge",
+    ): LoadedMedia {
+        var current = app
+        var lastError: CastProtocolException? = null
+        retiredMediaSessions.clear()
+
+        for (attempt in 1..LOAD_ATTEMPTS) {
+            try {
+                return LoadedMedia(current, load(current.transportId, url, title))
+            } catch (error: CastProtocolException) {
+                lastError = error
+                if (attempt >= LOAD_ATTEMPTS) break
+                log("LOAD attempt $attempt failed (${error.message}); restarting the receiver")
+                mediaStatus?.mediaSessionId?.takeIf { it > 0 }?.let { retiredMediaSessions += it }
+                current = restartReceiver(current)
+            }
+        }
+
+        throw lastError ?: CastProtocolException("The Chromecast rejected the stream.")
+    }
+
+    /**
+     * Ends the receiver app and launches a fresh one, which clears a stuck media player.
+     *
+     * A LAUNCH that reaches the receiver before the stop has taken effect reports the old session,
+     * so the launch is repeated until the receiver answers with a different session id.
+     */
+    private fun restartReceiver(previous: ReceiverApplication): ReceiverApplication {
+        runCatching { stopReceiver(previous.sessionId) }
+        var lastError: Exception? = null
+
+        repeat(RESTART_ATTEMPTS) { index ->
+            if (index > 0) runCatching { Thread.sleep(RESTART_PAUSE_MILLIS) }
+            try {
+                val app = launchReceiver(timeoutMillis = RESTART_LAUNCH_TIMEOUT_MILLIS)
+                if (app.sessionId != previous.sessionId) return app
+                lastError = CastProtocolException("The Chromecast did not restart the receiver.")
+            } catch (error: Exception) {
+                lastError = error
+            }
+        }
+
+        throw CastProtocolException("The Chromecast did not restart the receiver.", lastError)
     }
 
     fun stopMedia(transportId: String, mediaSessionId: Long?) {
@@ -435,6 +523,10 @@ internal class CastV2Client(
         private const val CONNECT_TIMEOUT_MILLIS = 5_000L
         private const val LAUNCH_TIMEOUT_MILLIS = 15_000L
         private const val LOAD_TIMEOUT_MILLIS = 20_000L
+        private const val LOAD_ATTEMPTS = 3
+        private const val RESTART_ATTEMPTS = 3
+        private const val RESTART_PAUSE_MILLIS = 1_500L
+        private const val RESTART_LAUNCH_TIMEOUT_MILLIS = 10_000L
         private const val HEARTBEAT_INTERVAL_MILLIS = 5_000L
     }
 }
