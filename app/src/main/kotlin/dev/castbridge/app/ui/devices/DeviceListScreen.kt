@@ -1014,6 +1014,26 @@ private fun CastControls(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    val otherDevice = selectedDevice?.takeIf { it.id != casting.deviceId }
+                    if (otherDevice != null) {
+                        Spacer(Modifier.height(10.dp))
+                        SwitchDeviceButton(
+                            deviceName = otherDevice.name,
+                            onClick = onCast,
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = onStopCast,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Text(stringResource(R.string.cast_cancel))
+                    }
                 }
 
                 is CastingState.Playing -> {
@@ -1056,7 +1076,17 @@ private fun CastControls(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(Modifier.height(10.dp))
+                    val otherDevice = selectedDevice?.takeIf { it.id != casting.deviceId }
+                    if (otherDevice != null) {
+                        Spacer(Modifier.height(10.dp))
+                        SwitchDeviceButton(
+                            deviceName = otherDevice.name,
+                            onClick = onCast,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    } else {
+                        Spacer(Modifier.height(10.dp))
+                    }
                     OutlinedButton(
                         onClick = onStopCast,
                         modifier = Modifier
@@ -1133,6 +1163,27 @@ private fun CastControls(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SwitchDeviceButton(
+    deviceName: String,
+    onClick: () -> Unit,
+) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(44.dp),
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_cast),
+            contentDescription = null,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(stringResource(R.string.cast_switch, deviceName))
     }
 }
 

@@ -74,8 +74,28 @@ class CastingController internal constructor(
             return
         }
 
+        // Switching TVs must not leave the previous one playing. The stop runs in its own job so a
+        // quick second switch cannot cancel it and leave the first TV running.
+        val previousDevice = activeDevice
+        val previousClient = castClient
+        val previousApp = castApp
+        val previousMediaSessionId = castMediaSessionId
+        val switching = previousDevice != null && previousDevice.id != device.id
+        val previousStop: Job? = if (previousDevice != null && previousDevice.id != device.id) {
+            scope.launch(Dispatchers.IO) {
+                stopDevice(previousDevice, previousClient, previousApp, previousMediaSessionId)
+            }
+        } else {
+            null
+        }
+
         cancelJob()
-        closeCastClient()
+        castClient = null
+        castApp = null
+        castMediaSessionId = null
+        activeUrl = null
+        // A same-device retry can drop the old socket right away; a switch still needs it to stop.
+        if (!switching) previousClient?.close()
 
         activeDevice = device
         activeUrl = url
@@ -84,6 +104,8 @@ class CastingController internal constructor(
         android.util.Log.d("Casting", "Casting to ${device.name} (${device.host}): $url")
         job = scope.launch {
             try {
+                previousStop?.join()
+
                 when (device) {
                     is ChromecastDevice -> playChromecast(device, url, pairingCode)
                     is RokuDevice -> playRoku(device, rokuUrl(url, width, height), pairingCode)
@@ -122,22 +144,7 @@ class CastingController internal constructor(
         _state.value = CastingState.Stopped(device.name)
         scope.launch {
             withContext(Dispatchers.IO) {
-                when {
-                    client != null && app != null -> {
-                        // Stop playback first, then end the receiver session, then drop the socket.
-                        runCatching { client.stopMedia(app.transportId, mediaSessionId) }
-                        runCatching { client.stopReceiver(app.sessionId) }
-                        client.close()
-                    }
-
-                    device is RokuDevice -> runCatching {
-                        roku.launchChannel(
-                            host = device.host,
-                            port = device.ecpPort,
-                            url = RokuEcpController.STOP_COMMAND,
-                        )
-                    }
-                }
+                stopDevice(device, client, app, mediaSessionId)
             }
         }
     }
@@ -271,12 +278,35 @@ class CastingController internal constructor(
         job = null
     }
 
-    private fun closeCastClient() {
-        castClient?.close()
-        castClient = null
-        castApp = null
-        castMediaSessionId = null
-        activeUrl = null
+    /**
+     * Ends playback on [device] and drops any open Cast connection. Used both when the user stops
+     * casting and when they switch to another TV. Every network step is best effort: the user's
+     * intent already happened locally, and a TV that is off or busy must not block it.
+     */
+    private suspend fun stopDevice(
+        device: CastDevice,
+        client: CastV2Client?,
+        app: ReceiverApplication?,
+        mediaSessionId: Long?,
+    ) {
+        when {
+            client != null -> {
+                // Stop playback first, then end the receiver session, then drop the socket.
+                if (app != null) {
+                    runCatching { client.stopMedia(app.transportId, mediaSessionId) }
+                    runCatching { client.stopReceiver(app.sessionId) }
+                }
+                client.close()
+            }
+
+            device is RokuDevice -> runCatching {
+                roku.launchChannel(
+                    host = device.host,
+                    port = device.ecpPort,
+                    url = RokuEcpController.STOP_COMMAND,
+                )
+            }
+        }
     }
 
     private companion object {

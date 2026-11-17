@@ -148,13 +148,18 @@ class DeviceListViewModel(
     }
 
     fun toggleSelection(deviceId: String) {
-        val next = if (selectedDeviceId.value == deviceId) null else deviceId
+        val previous = selectedDeviceId.value
+        val next = if (previous == deviceId) null else deviceId
         selectedDeviceId.value = next
 
         if (next != probeState.value.deviceId) {
             probeJob?.cancel()
             probeState.value = ProbeUiState()
         }
+
+        // A failure or stop notice belongs to the TV that produced it. Keeping it while another TV
+        // is selected would make "Try again" cast somewhere the message is not about.
+        if (next != previous) castingController.reset()
     }
 
     fun selectFilter(newFilter: DeviceFilter) {

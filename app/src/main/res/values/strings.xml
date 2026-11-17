@@ -93,6 +93,8 @@
     <string name="cast_pairing_code">Pairing code %1$s</string>
     <string name="cast_pairing_hint">The TV shows the same code.</string>
     <string name="cast_stop">Stop casting</string>
+    <string name="cast_cancel">Cancel</string>
+    <string name="cast_switch">Switch to %1$s</string>
     <string name="cast_stopped">Stopped on %1$s</string>
     <string name="cast_retry">Try again</string>
     <string name="cast_dismiss">Dismiss</string>

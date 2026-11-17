@@ -47,6 +47,8 @@ a developer account or an internet connection.
 - Shows a six-digit **pairing code** on both the phone and the TV so you can confirm the TV is
   playing *your* stream.
 - Detects when another phone takes over the Chromecast, and stops the session in the app.
+- Switches between TVs directly: picking another TV while casting stops the previous one first, so
+  only one screen plays at a time.
 - Fills the TV with the phone screen: the picture is scaled to cover the screen and centre-cropped,
   so a portrait phone does not leave large black bars on a landscape TV.
 - Shows the stream link in the app with a one-tap **Copy link** action and live segment/size stats.
@@ -263,6 +265,13 @@ stay in Roku's **Limited** control mode.
 
 The channel is a developer channel, not a store channel. Developer mode is free and needs no Roku
 account or developer registration. See [Install the Roku channel](#install-the-roku-channel).
+
+### Switching TVs
+
+Only one TV plays at a time. While casting, selecting another TV shows a **Switch to …** button next
+to **Stop casting**. Switching ends the session on the old TV before the new one is contacted, so the
+previous screen does not keep playing. A failure or stop notice belongs to the TV that produced it,
+so it is cleared as soon as another TV is selected instead of offering a retry on the wrong device.
 
 ### Pairing code
 
